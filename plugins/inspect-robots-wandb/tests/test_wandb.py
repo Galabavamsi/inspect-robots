@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from types import ModuleType
 from typing import NoReturn
 
 import pytest
 
+from inspect_robots import eval as run_eval
 from inspect_robots.log import EvalLog, EvalResults, EvalSpec, EvalStats
+from inspect_robots.mock import CubePickEmbodiment, NoopPolicy
+from inspect_robots.scene import Scene
+from inspect_robots.scorer import success_at_end
+from inspect_robots.task import Task
 from inspect_robots_wandb import WandbSink
 
 
@@ -218,6 +224,36 @@ def test_sink_closes_active_run_when_evaluation_aborts(
     assert fake.runs[0].logged == [
         {"eval/status": "error", "eval/error": "RuntimeError: grader exploded"}
     ]
+    assert fake.runs[0].finished_with == [1]
+
+
+def test_eval_abort_closes_run_through_core_lifecycle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The supported core closes a W&B run when evaluation aborts after startup."""
+    fake = _install_fake_wandb(monkeypatch)
+
+    def bad_grader(record: object, scene: object) -> None:
+        """Raise after the core has started all evaluation sinks."""
+        del record, scene
+        raise RuntimeError("grader exploded")
+
+    task = Task(
+        name="wandb-abort",
+        scenes=[Scene(id="s0", instruction="hold", init_seed=0)],
+        scorer=success_at_end(),
+        max_steps=1,
+    )
+    with pytest.raises(RuntimeError, match="grader exploded"):
+        run_eval(
+            task,
+            NoopPolicy(),
+            CubePickEmbodiment(),
+            log_dir=str(tmp_path),
+            sinks=[WandbSink(mode="disabled")],
+            before_scoring=bad_grader,
+        )
+
     assert fake.runs[0].finished_with == [1]
 
 

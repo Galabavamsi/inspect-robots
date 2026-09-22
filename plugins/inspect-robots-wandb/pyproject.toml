@@ -24,7 +24,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "inspect-robots>=0.57",
+    # The sink relies on the abort-cleanup hook introduced in the 0.60 core
+    # release; older cores leave failed W&B runs open.
+    "inspect-robots>=0.60.0",
     "wandb>=0.19.10",
 ]
 
