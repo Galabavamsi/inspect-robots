@@ -32,6 +32,7 @@ from inspect_robots.errors import ConfigError
 from inspect_robots.policy import PolicyBase, PolicyConfig, PolicyInfo
 from inspect_robots.scene import Scene
 from inspect_robots.spaces import Box
+from inspect_robots.task import TaskEnvelope
 from inspect_robots.types import ActionChunk, Observation
 
 if TYPE_CHECKING:
@@ -55,7 +56,7 @@ from inspect_robots_agent._png import png_data_url
 from inspect_robots_agent._responses import ResponsesClient
 from inspect_robots_agent._tools import PreCheck, Toolset, build_toolset
 
-from ._capture import WireCapture
+from ._capture import WireCapture, _safe
 
 _MAX_CONSECUTIVE_FAILURES = 3
 # Shared by the camera label writer and the reader that recovers revealed
@@ -749,6 +750,7 @@ class LLMAgentPolicy(PolicyBase):
         self._usage_totals: dict[str, int] = {}
         self._pending: _PendingCapture | None = None
         self._revealed: set[str] = set()
+        self._max_steps: int | None = None
 
     # -- lifecycle ---------------------------------------------------------------
 
@@ -773,6 +775,10 @@ class LLMAgentPolicy(PolicyBase):
             control_hz=embodiment_info.control_hz,
         )
 
+    def bind_task(self, envelope: TaskEnvelope) -> None:
+        """Learn the trial's rollout horizon from the task envelope."""
+        self._max_steps = envelope.max_steps
+
     def reset(self, scene: Scene) -> None:
         """Start a fresh per-trial conversation with the scene goal and call budget."""
         self._hindsight = None
@@ -783,6 +789,13 @@ class LLMAgentPolicy(PolicyBase):
         docs = self._embodiment_docs
         if docs is not None and docs.strip():
             formatted = formatted + "\n\nEmbodiment notes:\n" + docs.strip()
+        if self._max_steps is not None:
+            formatted += (
+                f"\n\nEnvironment step budget:\nYou have {self._max_steps} environment steps "
+                "for the trial. Every move tool result reports its step count (e.g. "
+                "`executing move_to over N steps (X.Xs)`). Pace yourself against the "
+                "environment step budget, not only the call budget."
+            )
         if self._prior_learnings_text is not None:
             formatted = (
                 formatted
@@ -807,7 +820,7 @@ class LLMAgentPolicy(PolicyBase):
     def on_trial_start(self, scene_id: str, epoch: int, log_dir: str, run_id: str) -> None:
         """Begin streaming wire attempts for the next trial when enabled."""
         if self._capture is not None:
-            self._capture.begin_trial(log_dir, run_id, f"{scene_id}-e{epoch}")
+            self._capture.begin_trial(log_dir, run_id, f"{_safe(scene_id)}-e{epoch}")
 
     def on_trial_end(self, record: TrialRecord, log_dir: str, run_id: str) -> None:
         """Persist wire capture, hindsight, usage, and the transcript at trial end."""
@@ -833,7 +846,7 @@ class LLMAgentPolicy(PolicyBase):
         transcript_dir = Path(log_dir) / "transcripts" / run_id
         transcript_dir.mkdir(parents=True, exist_ok=True)
 
-        trial_id = f"{record.scene_id}-e{record.epoch}"
+        trial_id = f"{_safe(record.scene_id)}-e{record.epoch}"
         path = transcript_dir / f"{trial_id}.jsonl"
 
         with path.open("w", encoding="utf-8") as f:
@@ -891,6 +904,7 @@ class LLMAgentPolicy(PolicyBase):
         observation_content = _observation_content(
             observation,
             self._state_labels,
+            max_steps=self._max_steps,
             reveal=reveal,
             narration=narration,
             depth=depth,
@@ -910,7 +924,7 @@ class LLMAgentPolicy(PolicyBase):
         state_summary = " | ".join(_state_lines(observation, self._state_labels))
         if state_summary:
             summary = f"{summary}, {state_summary}"
-        step_label = _step_label(observation)
+        step_label = _step_label(observation, self._max_steps)
         if step_label:
             self._echo(f"[agent] >> {step_label}: {summary}")
         else:
@@ -1205,10 +1219,14 @@ def _state_lines(
     return lines
 
 
-def _step_label(observation: Observation) -> str:
-    """Shared prompt/echo step gate: "step {n}" for int env_step (bool included), else ""."""
+def _step_label(observation: Observation, max_steps: int | None = None) -> str:
+    """Shared prompt/echo step gate: "step {n}" (or "step {n}/{max_steps}"), else ""."""
     step = observation.extra.get("env_step")
-    return f"step {step}" if isinstance(step, int) else ""
+    if not isinstance(step, int):
+        return ""
+    if max_steps is not None:
+        return f"step {step}/{max_steps}"
+    return f"step {step}"
 
 
 def _approvals_line(observation: Observation) -> str | None:
@@ -1251,6 +1269,7 @@ def _observation_content(
     observation: Observation,
     state_labels: tuple[str, tuple[str, ...]] | None = None,
     *,
+    max_steps: int | None = None,
     reveal: tuple[str, ...] | None = None,
     narration: str | None = None,
     depth: Mapping[str, Any] | None = None,
@@ -1259,6 +1278,10 @@ def _observation_content(
     lines = ["Current observation."]
     if observation.instruction:
         lines.append(f"Instruction: {observation.instruction}")
+    step = observation.extra.get("env_step")
+    if isinstance(step, int) and max_steps is not None:
+        remaining = max_steps - step
+        lines.append(f"Step budget: step {step}/{max_steps} ({remaining} env steps remaining).")
     lines.extend(_state_lines(observation, state_labels))
     app_line = _approvals_line(observation)
     if app_line is not None:

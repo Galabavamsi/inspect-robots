@@ -179,7 +179,10 @@ tool result does not report seconds.
 
 When the embodiment publishes operating notes via `EmbodimentInfo.docs`
 (joint layout, sign conventions, gripper polarity), the policy appends them
-to the system prompt as an `Embodiment notes:` section. The per-step
+to the system prompt as an `Embodiment notes:` section. When run under `eval()`,
+the policy receives the trial horizon via `bind_task()` and appends an
+`Environment step budget:` section to the system prompt, as well as tracking
+remaining environment steps in each observation. The per-step
 observation also labels the proprioceptive state vector with the action
 dimension names (`left_j0=0.01 ...`) whenever the mapping is unambiguous.
 

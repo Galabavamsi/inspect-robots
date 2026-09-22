@@ -40,6 +40,14 @@ def _golden_log() -> EvalLog:
             created="2026-06-26T00:00:00+00:00",
             inspect_robots_version="0.0.0",
             git_commit="deadbeef",
+            grader="vlm",
+            grader_config={
+                "model": "judge-model",
+                "base_url": "https://example.invalid/v1",
+                "rubric": "Grade success if the cube moved.",
+                "max_cameras": 4,
+                "effort": None,
+            },
             seed=0,
             max_steps=1200,
         ),
@@ -127,6 +135,13 @@ def test_golden_log_reads_back(tmp_path: Path) -> None:
     }
     assert restored.samples[0].operator_judgements == ("yes",)
     assert restored.samples[0].judgement_sources == ("prompt",)
+    assert restored.eval.grader == "vlm"
+    assert restored.eval.grader_config["model"] == "judge-model"
+    assert restored.eval.grader_config["rubric"] == "Grade success if the cube moved."
+    assert restored.eval.grader_config["max_cameras"] == 4
+    # ``None`` (no reasoning_effort sent) must survive as null, not vanish.
+    assert restored.eval.grader_config["effort"] is None
+    assert "effort" in restored.eval.grader_config
     assert restored.samples[0].operator_notes == ("gripper closed early",)
     assert restored.samples[0].operator_messages == (({"t": 3, "text": "keep left <now>"},),)
     assert isinstance(restored.samples[0].operator_messages, tuple)
@@ -156,6 +171,8 @@ def test_v1_log_without_additive_fields_reads_back(tmp_path: Path) -> None:
     data = _golden_log().to_dict()
     del data["eval"]["max_steps"]
     del data["eval"]["max_seconds"]
+    del data["eval"]["grader"]
+    del data["eval"]["grader_config"]
     for sample in data["samples"]:
         del sample["instruction"]
         del sample["scene_metadata"]
@@ -181,6 +198,34 @@ def test_v1_log_without_additive_fields_reads_back(tmp_path: Path) -> None:
     assert restored.samples[0].policy_transcripts == ()
     assert restored.eval.max_steps is None
     assert restored.eval.max_seconds is None
+    assert restored.eval.grader is None
+    assert restored.eval.grader_config == {}
+
+
+def test_evalspec_positional_order_of_legacy_fields_is_preserved() -> None:
+    # ``grader`` / ``grader_config`` were added later; a caller that binds the
+    # older fields positionally must still land ``17, 120, 6.0`` on the horizon
+    # fields rather than on the new ones.
+    spec = EvalSpec("t", "p", "e", "now", "v", None, {}, {}, 17, 120, 6.0)
+
+    assert spec.seed == 17
+    assert spec.max_steps == 120
+    assert spec.max_seconds == 6.0
+    assert spec.grader is None
+    assert spec.grader_config == {}
+
+
+def test_evalspec_positional_provenance_is_preserved() -> None:
+    """Adding grader fields must not shift the existing provenance arguments."""
+    spec = EvalSpec(
+        "t", "p", "e", "now", "v", None, {}, {}, 17, 120, 6.0, "sim", "rev", "checkpoint"
+    )
+
+    assert spec.environment_id == "sim"
+    assert spec.environment_revision == "rev"
+    assert spec.policy_checkpoint == "checkpoint"
+    assert spec.grader is None
+    assert spec.grader_config == {}
 
 
 def test_seconds_horizon_round_trips_declared_and_resolved_values() -> None:
@@ -480,3 +525,94 @@ def test_store_frames_runs_do_not_overwrite_each_other(tmp_path: Path) -> None:
     assert len(dirs) == 2  # distinct per-run directories
     for d in dirs:
         assert list(Path(d).glob("*.npy"))  # both runs' frames still on disk
+
+
+def test_evalspec_provenance_fields_round_trip(tmp_path: Path) -> None:
+    """EvalSpec provenance fields survive a JSON round-trip."""
+    log = EvalLog(
+        version=SCHEMA_VERSION,
+        status="success",
+        eval=EvalSpec(
+            task="demo",
+            policy="scripted",
+            embodiment="cubepick",
+            created="2026-08-27T00:00:00+00:00",
+            inspect_robots_version="0.0.0",
+            environment_id="isaacsim-2026.1.0",
+            environment_revision="abc123def456",
+            policy_checkpoint="hf://robot-org/pi0@v1.2",
+        ),
+        results=EvalResults(total_scenes=1, total_trials=1),
+        stats=EvalStats(
+            started_at="2026-08-27T00:00:00+00:00",
+            completed_at="2026-08-27T00:00:01+00:00",
+            duration_s=1.0,
+            total_steps=5,
+        ),
+    )
+    path = tmp_path / "prov.json"
+    import json
+
+    path.write_text(json.dumps(log.to_dict()), encoding="utf-8")
+    restored = read_eval_log(str(path))
+    assert restored.eval.environment_id == "isaacsim-2026.1.0"
+    assert restored.eval.environment_revision == "abc123def456"
+    assert restored.eval.policy_checkpoint == "hf://robot-org/pi0@v1.2"
+
+
+def test_evalspec_provenance_fields_absent_in_older_log_read_as_none(tmp_path: Path) -> None:
+    """A log written before provenance fields existed reads back with None defaults."""
+    data = _golden_log().to_dict()
+    # Simulate an older log that has no provenance keys.
+    data["eval"].pop("environment_id", None)
+    data["eval"].pop("environment_revision", None)
+    data["eval"].pop("policy_checkpoint", None)
+    path = tmp_path / "old.json"
+    import json
+
+    path.write_text(json.dumps(data), encoding="utf-8")
+    restored = read_eval_log(str(path))
+    assert restored.eval.environment_id is None
+    assert restored.eval.environment_revision is None
+    assert restored.eval.policy_checkpoint is None
+
+
+def test_eval_populates_provenance_from_kwargs_and_info(tmp_path: Path) -> None:
+    """eval() forwards explicit provenance kwargs or derives from embodiment/policy info."""
+    from dataclasses import replace
+
+    from inspect_robots import eval
+    from inspect_robots.mock import CubePickEmbodiment, ScriptedPolicy
+    from inspect_robots.scorer import success_at_end
+
+    task = Task(
+        name="prov_task",
+        scenes=[Scene(id="s0", instruction="reach", init_seed=0)],
+        scorer=success_at_end(),
+        max_steps=2,
+    )
+
+    # 1. From explicit kwargs
+    logs = eval(
+        task,
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        log_dir=str(tmp_path / "run1"),
+        environment_id="sim-env-1",
+        environment_revision="git-sha-1",
+        policy_checkpoint="hf://org/model@v1",
+    )
+    assert logs[0].eval.environment_id == "sim-env-1"
+    assert logs[0].eval.environment_revision == "git-sha-1"
+    assert logs[0].eval.policy_checkpoint == "hf://org/model@v1"
+
+    # 2. Derived from info objects when kwargs are None
+    emb = CubePickEmbodiment()
+    emb.info = replace(emb.info, environment_id="emb-env", environment_revision="emb-rev")
+    pol = ScriptedPolicy()
+    pol.info = replace(pol.info, checkpoint="pol-ckpt")
+
+    logs2 = eval(task, pol, emb, log_dir=str(tmp_path / "run2"))
+    assert logs2[0].eval.environment_id == "emb-env"
+    assert logs2[0].eval.environment_revision == "emb-rev"
+    assert logs2[0].eval.policy_checkpoint == "pol-ckpt"
