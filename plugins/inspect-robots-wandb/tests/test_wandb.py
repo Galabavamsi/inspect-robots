@@ -135,6 +135,11 @@ def test_sink_initializes_wandb_with_spec_and_logs_final_summary(
                 "seed": 7,
                 "max_steps": 80,
                 "max_seconds": None,
+                "environment_id": None,
+                "environment_revision": None,
+                "policy_checkpoint": None,
+                "grader": None,
+                "grader_config": {},
             },
         }
     ]
