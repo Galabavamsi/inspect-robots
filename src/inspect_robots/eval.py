@@ -545,6 +545,8 @@ def _run_eval(
         scene_metadata = _json_safe_scene_metadata(scene.metadata)
         scene_status = "success"
         scene_error: str | None = None
+        scene_errored_trials = 0
+        scene_errors_retryable: list[bool] = []
 
         for epoch in range(epoch_spec.count):
             trial_seed = derive_seed(seed, scene.init_seed, epoch)
@@ -560,6 +562,7 @@ def _run_eval(
                     error_count += 1
                     scene_status = "error"
                     scene_error = f"policy.on_trial_start failed: {exc}"
+                    scene_errors_retryable.append(False)
                     record = TrialRecord(
                         scene_id=scene.id,
                         epoch=epoch,
@@ -587,6 +590,7 @@ def _run_eval(
                     error = str(exc)
                     scene_status = "cancelled"
                     scene_error = error
+                    scene_errors_retryable.append(False)
                     halted = True
                     cancelled_exc = exc
                     record = exc.record
@@ -597,12 +601,14 @@ def _run_eval(
                     error = f"{type(exc).__name__}: {exc}"
                     scene_status = "error"
                     scene_error = error
+                    scene_errors_retryable.append(False)
                     halted = True
                     record = exc.record
                 except PolicyError as exc:
                     error_count += 1
                     scene_status = "error"
                     scene_error = f"{type(exc).__name__}: {exc}"
+                    scene_errors_retryable.append(exc.retryable)
                     record = exc.record or TrialRecord(
                         scene_id=scene.id,
                         epoch=epoch,
@@ -622,6 +628,7 @@ def _run_eval(
                     epoch_dicts.append({})
                     if record.status == "error":
                         errored_trials += 1
+                        scene_errored_trials += 1
                     judgements.append(None)
                     judgement_sources.append(None)
                     notes.append(None)
@@ -674,6 +681,7 @@ def _run_eval(
                             # never crash the eval and lose the trials that ran.
                             detail = f"scorer {scorer.name!r} failed: {exc}"
                             scene_status = "error"
+                            scene_errors_retryable.append(False)
                             scene_error = (
                                 detail if scene_error is None else f"{scene_error}; {detail}"
                             )
@@ -704,6 +712,7 @@ def _run_eval(
                             # different thing entirely and is collected just above.
                             detail = f"policy.on_trial_end failed: {exc}"
                             scene_status = "error"
+                            scene_errors_retryable.append(False)
                             scene_error = (
                                 detail if scene_error is None else f"{scene_error}; {detail}"
                             )
@@ -762,6 +771,7 @@ def _run_eval(
                 # error log — it must never crash the eval and lose the log.
                 detail = f"reducer {epoch_spec.reducer!r} failed for scorer {name!r}: {exc}"
                 scene_status = "error"
+                scene_errors_retryable.append(False)
                 scene_error = detail if scene_error is None else f"{scene_error}; {detail}"
                 if status == "success":
                     status = "error"
@@ -783,6 +793,9 @@ def _run_eval(
                 termination_reasons=tuple(termination_reasons),
                 operator_messages=tuple(operator_messages),
                 policy_transcripts=tuple(policy_transcripts),
+                frames_dir=str(frame_store.root) if frame_store is not None else None,
+                errored_trials=scene_errored_trials,
+                retryable_error=bool(scene_errors_retryable) and all(scene_errors_retryable),
             )
         )
         if stopped:

@@ -176,10 +176,33 @@ def _connection_failure(exc: Exception) -> bool:
     return False
 
 
+def _timeout_failure(exc: Exception) -> bool:
+    """Return whether an exception chain contains a transport timeout."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, TimeoutError) or type(current).__name__ in {
+            "ConnectTimeout",
+            "ReadTimeout",
+            "TimeoutException",
+            "ReadTimeoutError",
+        }:
+            return True
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
+    return False
+
+
 def _policy_error(policy: Policy, exc: Exception) -> PolicyError:
     """Wrap a generic policy exception, appending a hint on connection failures."""
     message = str(exc)
-    if _connection_failure(exc):
+    connection_failure = _connection_failure(exc)
+    if connection_failure:
         try:
             url = getattr(policy, "server_url", None)
             remedy = getattr(policy, "remedy", None)
@@ -202,7 +225,7 @@ def _policy_error(policy: Policy, exc: Exception) -> PolicyError:
                 message += f"\nhint: {remedy}"
         except Exception:
             pass  # a raising server_url/remedy property must not mask the trial error
-    return PolicyError(message)
+    return PolicyError(message, retryable=connection_failure or _timeout_failure(exc))
 
 
 def _non_finite_detail(data: object) -> str | None:

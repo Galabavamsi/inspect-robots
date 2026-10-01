@@ -141,6 +141,10 @@ class SceneResult:
     # Strictly parallel to ``epochs``: the policy's audit record per trial,
     # ``None`` when unavailable. The default keeps older schema-v1 logs readable.
     policy_transcripts: tuple[Any, ...] = ()
+    # The owning attempt frame root; aggregate logs may select scenes from different runs.
+    frames_dir: str | None = None
+    errored_trials: int = 0
+    retryable_error: bool = False
 
 
 @dataclass(frozen=True)
@@ -167,6 +171,8 @@ class EvalLog:
     stats: EvalStats
     samples: tuple[SceneResult, ...] = ()
     error: str | None = None
+    # Immutable attempt-log paths included in a resumed aggregate.
+    source_logs: tuple[str, ...] = ()
 
     SCHEMA_VERSION: ClassVar[int] = SCHEMA_VERSION
 
@@ -208,6 +214,7 @@ class EvalLog:
             stats=EvalStats(**data["stats"]),
             samples=tuple(samples),
             error=data.get("error"),
+            source_logs=tuple(data.get("source_logs", ())),
         )
 
 
