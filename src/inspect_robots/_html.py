@@ -1662,7 +1662,8 @@ def render_html(
         ]
         effective_budget = min(finite_limits) if finite_limits else 0
     has_scene_override = include_scene_frames and any(
-        scene.frames_dir is not None for scene in log.samples
+        scene.frames_dir is not None and scene.frames_dir != log.stats.frames_dir
+        for scene in log.samples
     )
     budget = _FrameBudget(
         limit=effective_budget,

@@ -1054,6 +1054,11 @@ def test_live_frame_budget_allocates_newest_first_and_reuses_encoded_cache(
             ),
         )
     )
+    log = dataclasses.replace(
+        log,
+        stats=dataclasses.replace(log.stats, frames_dir=str(tmp_path)),
+        samples=(dataclasses.replace(log.samples[0], frames_dir=str(tmp_path)),),
+    )
     encode_calls: list[npt.NDArray[np.uint8]] = []
     encode = png_data_url
 
