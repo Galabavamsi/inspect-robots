@@ -959,6 +959,8 @@ def eval_set(
     to restart their scene during this invocation. Each retry begins at epoch zero.
     ``checkpoint_inputs`` adds caller-specific, JSON-serializable settings to the
     identity comparison. Its values are stored only as a SHA-256 digest.
+    An attempt without a saved log leaves the checkpoint in flight; a later
+    call fails before robot reset so the operator can reconcile the run.
     """
     before_scoring, resolved_grader = _grading_hook(grader, before_scoring)
     task_list = [tasks] if isinstance(tasks, Task | str) else list(tasks)
@@ -1087,6 +1089,48 @@ def _resumable_eval_set(
     from inspect_robots.registry import resolve
 
     checkpoint = Path(checkpoint_path) if checkpoint_path is not None else None
+    if checkpoint is not None and (isinstance(policy, str) or isinstance(embodiment, str)):
+        # Resolve registry components even when every scene is already complete.
+        # Otherwise a changed factory could reuse scores without ever being opened.
+        resolved_policy = (
+            cast(Policy, resolve("policy", policy)) if isinstance(policy, str) else policy
+        )
+        owns_embodiment = isinstance(embodiment, str)
+        resolved_embodiment: Embodiment
+        if isinstance(embodiment, str):
+            resolved_embodiment = cast(Embodiment, resolve("embodiment", embodiment))
+        else:
+            resolved_embodiment = embodiment
+        try:
+            return _resumable_eval_set(
+                task_list,
+                resolved_policy,
+                resolved_embodiment,
+                log_dir=log_dir,
+                sinks=sinks,
+                seed=seed,
+                fail_on_error=fail_on_error,
+                controller=controller,
+                approver=approver,
+                remap=remap,
+                store_frames=store_frames,
+                store_actions=store_actions,
+                operator_input=operator_input,
+                before_scoring=before_scoring,
+                grader=grader,
+                retry_attempts=retry_attempts,
+                checkpoint_path=checkpoint_path,
+                checkpoint_inputs=checkpoint_inputs,
+            )
+        finally:
+            if owns_embodiment:
+                resolved_embodiment.close()
+    if checkpoint is not None:
+        # Adaptive policies publish their actual spaces only after binding to
+        # the robot. eval() binds again before each attempt; bind is idempotent.
+        bind = getattr(policy, "bind", None)
+        if callable(bind):
+            bind(cast(Embodiment, embodiment).info)
     if seed is None:
         seed = _checkpoint_seed(checkpoint) if checkpoint is not None else None
         if seed is None:
@@ -1180,6 +1224,8 @@ def _resumable_eval_set(
                     json_sink = JsonLogSink(log_dir)
                     attempt_sinks = [json_sink, *(sinks or [])]
                 _clear_json_sink_path(json_sink)
+                if manifest is not None:
+                    manifest.start_attempt()
                 try:
                     (attempt_log,) = eval(
                         attempt_task,

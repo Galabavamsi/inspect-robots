@@ -161,11 +161,11 @@ def _connection_failure(exc: Exception) -> bool:
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, ConnectionError) or type(current).__name__ in {
-            "ConnectionError",
-            "NewConnectionError",
-            "ConnectError",
-        }:
+        cls = type(current)
+        if isinstance(current, ConnectionError) or (
+            cls.__module__.split(".", 1)[0] in {"httpx", "urllib3", "requests"}
+            and cls.__name__ in {"ConnectionError", "NewConnectionError", "ConnectError"}
+        ):
             return True
         if current.__cause__ is not None:
             current = current.__cause__
@@ -182,12 +182,12 @@ def _timeout_failure(exc: Exception) -> bool:
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, TimeoutError) or type(current).__name__ in {
-            "ConnectTimeout",
-            "ReadTimeout",
-            "TimeoutException",
-            "ReadTimeoutError",
-        }:
+        cls = type(current)
+        if isinstance(current, TimeoutError) or (
+            cls.__module__.split(".", 1)[0] in {"httpx", "urllib3", "requests"}
+            and cls.__name__
+            in {"ConnectTimeout", "ReadTimeout", "TimeoutException", "ReadTimeoutError"}
+        ):
             return True
         if current.__cause__ is not None:
             current = current.__cause__
@@ -408,7 +408,7 @@ def rollout(
                 _record_failure(record, exc, t)
                 raise
             except Exception as exc:
-                raise _record_failure(record, _policy_error(policy, exc), t) from exc
+                raise _record_failure(record, PolicyError(str(exc)), t) from exc
 
             inferences = store.get(_INFER_KEY, [])
             if len(inferences) > prev_inferences:

@@ -807,6 +807,10 @@ def test_named_connection_error_chain_records_url_and_remedy_hint() -> None:
     class ConnectionError(Exception):
         pass
 
+    # Mimic an optional transport dependency without importing it in the core test.
+    NewConnectionError.__module__ = "urllib3.exceptions"
+    ConnectionError.__module__ = "urllib3.exceptions"
+
     class _ServerPolicy(_BoomPolicy):
         def __init__(self) -> None:
             super().__init__()
@@ -859,6 +863,15 @@ def test_timeout_chain_is_retryable_without_connection_hint() -> None:
     wrapped = _policy_error(_BoomPolicy(), exc)
     assert wrapped.retryable is True
     assert "hint:" not in str(wrapped)
+
+
+def test_unrelated_named_timeout_is_not_auto_retryable() -> None:
+    class ReadTimeout(Exception):
+        pass
+
+    assert _policy_error(_BoomPolicy(), ReadTimeout("unrelated timeout")).retryable is False
+    ReadTimeout.__module__ = "httpx._exceptions"
+    assert _policy_error(_BoomPolicy(), ReadTimeout("transport timeout")).retryable is True
 
 
 def test_connection_failure_context_cycle_terminates() -> None:

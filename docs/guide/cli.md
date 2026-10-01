@@ -507,17 +507,25 @@ directory so `inspect-robots view LOG_DIR` sees only evaluation logs.
 
 `--retry-attempts N` permits up to N additional attempts for each scene during
 the current call, with or without a checkpoint. Automatic retries apply only
-to `PolicyError(retryable=True)`, including policy connection and timeout
-failures wrapped by the rollout. Each retry starts that scene at epoch zero
+to `PolicyError(retryable=True)`, including recognized policy connection and
+timeout failures through the built-in controllers. Controller scheduling
+failures are not retried. Each retry starts that scene at epoch zero
 with the same seed. Ordinary policy errors, malformed actions, scorer errors,
 safety aborts, embodiment faults, and Ctrl-C do not trigger an automatic
 retry. A later explicit call with the same checkpoint attempts any unfinished
 scene, including one that was not eligible for automatic retry.
 
+The checkpoint marks an attempt in flight before it starts and clears the mark
+when its log is saved. If a crash or grading-hook error leaves the mark set,
+the next invocation stops before resetting the robot. Inspect the robot and
+attempt files, then start a new checkpoint after reconciling that run.
+
 The checkpoint contains paths to immutable attempt logs. The returned and
 saved aggregate log lists them in `source_logs` and selects one result per
-scene. The checkpoint matches task declarations, published policy and embodiment
-descriptions (including their spaces and capabilities), seed,
+scene. Metrics with non-finite or saved `null` scene scores are omitted from
+the aggregate. The checkpoint matches task declarations, scorer settings,
+published policy and embodiment descriptions (including their spaces and
+capabilities), seed,
 `log_dir`, scoring and artifact options, and the CLI's resolved constructor
 arguments and guardrail settings. Constructor arguments and caller supplied
 `checkpoint_inputs` are recorded as a digest, not as raw values. For API
@@ -525,11 +533,14 @@ calls, pass `checkpoint_inputs={"rig_revision": "..."}` to include settings
 that the framework cannot inspect. Keep external model weights, policy
 servers, and rig calibration consistent across calls. A changed model or
 hardware state outside the recorded inputs cannot be detected automatically.
+Custom scorers can provide a JSON-serializable `checkpoint_identity()` method
+to identify stable settings; otherwise the framework uses their dataclass
+fields or instance attributes.
 
 Only one process can write a checkpoint at a time. If a process dies and
 leaves the sibling `.lock` file, verify that it has stopped before removing
-the lock. A hard kill before an attempt log is written cannot recover that
-in-progress attempt. `--rerun` remains a `run`-only option.
+the lock. A hard kill before an attempt log is written cannot automatically
+recover that in-progress attempt. `--rerun` remains a `run`-only option.
 
 ## `inspect-robots doctor`
 

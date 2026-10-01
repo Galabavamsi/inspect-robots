@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
@@ -18,6 +19,7 @@ from inspect_robots.embodiment import Embodiment
 from inspect_robots.errors import ConfigError
 from inspect_robots.log import read_eval_log
 from inspect_robots.policy import Policy
+from inspect_robots.scorer import Scorer
 from inspect_robots.task import Task
 
 _CHECKPOINT_VERSION = 1
@@ -30,6 +32,30 @@ def _identity_json_default(value: object) -> object:
     if isinstance(value, frozenset):
         return sorted(value)
     raise TypeError(f"unsupported checkpoint identity value: {type(value).__name__}")
+
+
+def _scorer_identity(scorer: Scorer) -> dict[str, str]:
+    """Fingerprint scorer settings without putting their raw values in the manifest."""
+    scorer_object: object = scorer
+    identity_hook = getattr(scorer, "checkpoint_identity", None)
+    if callable(identity_hook):
+        config = identity_hook()
+    elif is_dataclass(scorer_object):
+        config = asdict(cast(Any, scorer_object))
+    else:
+        try:
+            config = vars(scorer)
+        except TypeError as exc:
+            raise ConfigError(
+                f"scorer {scorer.name!r} needs a JSON checkpoint_identity() hook"
+            ) from exc
+    encoded = json.dumps(config, sort_keys=True, allow_nan=False, default=_identity_json_default)
+    cls = type(scorer)
+    return {
+        "name": scorer.name,
+        "type": f"{cls.__module__}.{cls.__qualname__}",
+        "config_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+    }
 
 
 def _identity(
@@ -48,7 +74,7 @@ def _identity(
                 "name": task.name,
                 "scenes": [asdict(scene) for scene in task.scenes],
                 "epochs": asdict(task.epoch_spec),
-                "scorers": [scorer.name for scorer in task.scorers],
+                "scorers": [_scorer_identity(scorer) for scorer in task.scorers],
                 "max_steps": task.max_steps,
                 "max_seconds": task.max_seconds,
                 "metadata": task.metadata,
@@ -91,6 +117,7 @@ class _Manifest:
     identity: dict[str, object]
     attempts: list[dict[str, object]] = field(default_factory=list)
     aggregates: dict[str, str] = field(default_factory=dict)
+    in_flight: bool = False
 
     def attempt_log_path(self, entry: Mapping[str, object]) -> Path:
         """Resolve and validate a referenced immutable attempt log."""
@@ -136,11 +163,24 @@ class _Manifest:
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
         self.attempt_log_path(entry)
+        prior_in_flight = self.in_flight
         self.attempts.append(entry)
+        self.in_flight = False
         try:
             self.write_atomic()
         except Exception:
             self.attempts.pop()
+            self.in_flight = prior_in_flight
+            raise
+
+    def start_attempt(self) -> None:
+        """Mark an attempt ambiguous until its durable log is in the manifest."""
+        prior = self.in_flight
+        self.in_flight = True
+        try:
+            self.write_atomic()
+        except Exception:
+            self.in_flight = prior
             raise
 
     def set_aggregate(self, task_index: int, log_path: Path) -> None:
@@ -164,6 +204,7 @@ class _Manifest:
             "identity": self.identity,
             "attempts": self.attempts,
             "aggregates": self.aggregates,
+            "in_flight": self.in_flight,
         }
         try:
             with tmp.open("w", encoding="utf-8") as handle:
@@ -211,9 +252,19 @@ def _open_checkpoint(path: Path, identity: dict[str, object]) -> Iterator[_Manif
                     raise ConfigError("checkpoint identity differs from this evaluation set")
                 attempts = data["attempts"]
                 aggregates = data.get("aggregates", {})
-                if not isinstance(attempts, list) or not isinstance(aggregates, dict):
+                in_flight = data.get("in_flight", False)
+                if (
+                    not isinstance(attempts, list)
+                    or not isinstance(aggregates, dict)
+                    or not isinstance(in_flight, bool)
+                ):
                     raise ValueError("invalid checkpoint entries")
-                manifest = _Manifest(path, identity, attempts, aggregates)
+                if in_flight:
+                    raise ConfigError(
+                        "checkpoint has an unfinished attempt without a saved log; "
+                        "inspect the robot and attempt files before starting a new checkpoint"
+                    )
+                manifest = _Manifest(path, identity, attempts, aggregates, in_flight)
                 for entry in manifest.attempts:
                     manifest.attempt_log_path(entry)
             except (KeyError, TypeError, ValueError, OSError) as exc:

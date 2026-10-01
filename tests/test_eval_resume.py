@@ -140,6 +140,55 @@ def test_checkpoint_rejects_non_json_scene_before_creation(tmp_path: Path) -> No
         )
 
 
+def test_checkpoint_scorer_hook_and_opaque_scorer_identity(tmp_path: Path) -> None:
+    """A scorer can expose stable settings; opaque scorers fail before rollout."""
+    from dataclasses import replace
+
+    from inspect_robots._eval_set_checkpoint import _identity
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.rollout import TrialRecord
+    from inspect_robots.scene import Target
+    from inspect_robots.scorer import Score
+
+    class _HookScorer:
+        __slots__ = ()
+        name = "hook"
+
+        def checkpoint_identity(self) -> dict[str, float]:
+            return {"threshold": 0.5}
+
+        def __call__(self, record: TrialRecord, target: Target | None) -> Score:
+            del record, target
+            return Score(value=1.0)
+
+    class _OpaqueScorer:
+        __slots__ = ()
+        name = "opaque"
+
+        def __call__(self, record: TrialRecord, target: Target | None) -> Score:
+            del record, target
+            return Score(value=1.0)
+
+    identity = _identity(
+        [replace(_task(), scorer=_HookScorer())],
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        seed=17,
+        log_dir=str(tmp_path),
+        options={},
+    )
+    assert identity["tasks"][0]["scorers"][0]["name"] == "hook"  # type: ignore[index]
+    with pytest.raises(ConfigError, match="checkpoint_identity"):
+        _identity(
+            [replace(_task(), scorer=_OpaqueScorer())],
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            seed=17,
+            log_dir=str(tmp_path),
+            options={},
+        )
+
+
 def test_checkpoint_lock_blocks_second_writer(tmp_path: Path) -> None:
     """A live writer must prevent another process from mutating the manifest."""
     from inspect_robots._eval_set_checkpoint import _identity, _open_checkpoint
@@ -295,6 +344,33 @@ def test_checkpoint_atomic_failure_retains_previous_manifest(tmp_path: Path) -> 
         assert manifest.aggregates["0"] == previous_aggregate
 
 
+def test_checkpoint_start_failure_does_not_move_robot_or_mark_in_flight(tmp_path: Path) -> None:
+    """A failed pre-attempt manifest publication leaves the old checkpoint usable."""
+    from inspect_robots._eval_set_checkpoint import _open_checkpoint
+
+    checkpoint = tmp_path / "run.json"
+    log_path = _saved_attempt(tmp_path)
+    with _open_checkpoint(checkpoint, _checkpoint_identity(tmp_path)) as manifest:
+        before = checkpoint.read_text()
+        with (
+            patch("inspect_robots._eval_set_checkpoint.os.replace", side_effect=OSError("disk")),
+            pytest.raises(OSError, match="disk"),
+        ):
+            manifest.start_attempt()
+        assert manifest.in_flight is False
+        assert checkpoint.read_text() == before
+        manifest.start_attempt()
+        assert json.loads(checkpoint.read_text())["in_flight"] is True
+        with (
+            patch("inspect_robots._eval_set_checkpoint.os.replace", side_effect=OSError("disk")),
+            pytest.raises(OSError, match="disk"),
+        ):
+            manifest.add_attempt(0, ["s0", "s1"], log_path)
+        assert json.loads(checkpoint.read_text())["in_flight"] is True
+        manifest.add_attempt(0, ["s0", "s1"], log_path)
+        assert manifest.in_flight is False
+
+
 def test_checkpoint_invalid_schema_and_entries_fail_closed(tmp_path: Path) -> None:
     """Corrupt or unknown manifests fail before they can schedule work."""
     from inspect_robots._eval_set_checkpoint import _open_checkpoint
@@ -309,6 +385,7 @@ def test_checkpoint_invalid_schema_and_entries_fail_closed(tmp_path: Path) -> No
         {**original, "version": 999},
         {**original, "attempts": "bad"},
         {**original, "aggregates": []},
+        {**original, "in_flight": "bad"},
         {**original, "attempts": [{}]},
         {"version": 1, "identity": identity},
     ]
@@ -664,6 +741,239 @@ def test_checkpoint_rejects_changed_spaces_before_robot_reset(tmp_path: Path) ->
     assert same_robot.resets == 0
 
 
+def test_checkpoint_rejects_changed_scorer_settings(tmp_path: Path) -> None:
+    """A scorer's threshold is part of the saved result's meaning."""
+    from dataclasses import replace
+
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.scorer import reached_goal_state
+
+    task = replace(_task(), scorer=reached_goal_state(0.05))
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    eval_set(
+        task,
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    with pytest.raises(ConfigError, match="checkpoint identity"):
+        eval_set(
+            replace(task, scorer=reached_goal_state(0.001)),
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            checkpoint_path=str(checkpoint),
+            log_dir=str(log_dir),
+        )
+
+
+def test_checkpoint_resolves_string_component_identity_before_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A changed registered factory cannot reuse old scenes under the same name."""
+    from dataclasses import replace
+
+    from inspect_robots import registry
+    from inspect_robots.errors import ConfigError
+
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    success, _ = eval_set(
+        _task(),
+        "scripted",
+        "cubepick",
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    assert success
+    original_factory = registry.registered("embodiment")["cubepick"]
+
+    class _ChangedRobot(CubePickEmbodiment):
+        def __init__(self) -> None:
+            super().__init__()
+            self.closed = False
+            self.info = replace(self.info, environment_revision="new-rig-revision")
+
+        def close(self) -> None:
+            self.closed = True
+
+    made: list[_ChangedRobot] = []
+
+    def changed_robot_factory() -> _ChangedRobot:
+        robot = _ChangedRobot()
+        made.append(robot)
+        return robot
+
+    monkeypatch.setitem(registry._FACTORIES["embodiment"], "cubepick", changed_robot_factory)
+    with pytest.raises(ConfigError, match="checkpoint identity"):
+        eval_set(
+            _task(),
+            "scripted",
+            "cubepick",
+            checkpoint_path=str(checkpoint),
+            log_dir=str(log_dir),
+        )
+    assert len(made) == 1 and made[0].closed
+
+    monkeypatch.setitem(registry._FACTORIES["embodiment"], "cubepick", original_factory)
+    original_policy_factory = registry.registered("policy")["scripted"]
+
+    def changed_policy_factory() -> ScriptedPolicy:
+        policy = ScriptedPolicy()
+        policy.info = replace(policy.info, checkpoint="new-model-revision")
+        return policy
+
+    monkeypatch.setitem(registry._FACTORIES["policy"], "scripted", changed_policy_factory)
+    with pytest.raises(ConfigError, match="checkpoint identity"):
+        eval_set(
+            _task(),
+            "scripted",
+            "cubepick",
+            checkpoint_path=str(checkpoint),
+            log_dir=str(log_dir),
+        )
+    monkeypatch.setitem(registry._FACTORIES["policy"], "scripted", original_policy_factory)
+
+    # A registered policy can also run against a caller-owned robot instance.
+    mixed_success, _ = eval_set(
+        _task(),
+        "scripted",
+        CubePickEmbodiment(),
+        checkpoint_path=str(tmp_path / "mixed.json"),
+        log_dir=str(log_dir),
+    )
+    assert mixed_success
+
+
+def test_checkpoint_fingerprints_adaptive_policy_after_bind(tmp_path: Path) -> None:
+    """A policy that adopts the robot's spaces has one effective identity."""
+    from dataclasses import replace
+
+    from inspect_robots.embodiment import EmbodimentInfo
+    from inspect_robots.spaces import Box
+
+    class _AdaptivePolicy(ScriptedPolicy):
+        def __init__(self) -> None:
+            super().__init__()
+            self.info = replace(self.info, action_space=Box(shape=(1,)))
+
+        def bind(self, embodiment_info: EmbodimentInfo) -> None:
+            self.info = replace(self.info, action_space=embodiment_info.action_space)
+
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    policy = _AdaptivePolicy()
+    first_success, first_logs = eval_set(
+        _task(),
+        policy,
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    same_success, same_logs = eval_set(
+        _task(),
+        policy,
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    fresh_success, fresh_logs = eval_set(
+        _task(),
+        _AdaptivePolicy(),
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    assert first_success and same_success and fresh_success
+    assert same_logs[0].source_logs == first_logs[0].source_logs
+    assert fresh_logs[0].source_logs == first_logs[0].source_logs
+
+
+def test_checkpoint_blocks_ambiguous_attempt_after_grading_failure(tmp_path: Path) -> None:
+    """A post-step hook failure cannot let a later call replay hidden robot work."""
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.rollout import TrialRecord
+
+    class _ResetSpy(CubePickEmbodiment):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resets = 0
+
+        def reset(self, scene: Scene, *, seed: int | None = None):  # type: ignore[no-untyped-def]
+            self.resets += 1
+            return super().reset(scene, seed=seed)
+
+    def failing_grade(_record: TrialRecord, _scene: Scene) -> None:
+        raise RuntimeError("grader disconnected")
+
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    first_robot = _ResetSpy()
+    success, _ = eval_set(
+        _task(),
+        ScriptedPolicy(),
+        first_robot,
+        before_scoring=failing_grade,
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    assert success is False
+    assert first_robot.resets == 1
+    assert json.loads(checkpoint.read_text())["in_flight"] is True
+    assert json.loads(checkpoint.read_text())["attempts"] == []
+
+    second_robot = _ResetSpy()
+    with pytest.raises(ConfigError, match="unfinished attempt"):
+        eval_set(
+            _task(),
+            ScriptedPolicy(),
+            second_robot,
+            before_scoring=failing_grade,
+            checkpoint_path=str(checkpoint),
+            log_dir=str(log_dir),
+        )
+    assert second_robot.resets == 0
+
+
+def test_checkpoint_resume_handles_nonfinite_saved_score(tmp_path: Path) -> None:
+    """Strict JSON null scores omit an invalid aggregate metric on every call."""
+    from dataclasses import replace
+
+    from inspect_robots.rollout import TrialRecord
+    from inspect_robots.scene import Target
+    from inspect_robots.scorer import Score
+
+    class _NonfiniteScorer:
+        name = "nonfinite"
+
+        def __call__(self, record: TrialRecord, target: Target | None) -> Score:
+            del record, target
+            return Score(value=float("inf"))
+
+    task = replace(_task(), scorer=_NonfiniteScorer())
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    first_success, first_logs = eval_set(
+        task,
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    again_success, again_logs = eval_set(
+        task,
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    assert first_success and again_success
+    assert "nonfinite" not in first_logs[0].results.metrics
+    assert "nonfinite" not in again_logs[0].results.metrics
+    assert again_logs[0].source_logs == first_logs[0].source_logs
+
+
 @pytest.mark.parametrize("attempts", [-1, True, 1.5])
 def test_eval_set_rejects_invalid_retry_budget(attempts: object, tmp_path: Path) -> None:
     """A malformed retry budget cannot silently alter hardware run length."""
@@ -700,6 +1010,35 @@ def test_eval_set_retry_budget_is_bounded_for_repeated_transient_failures(tmp_pa
     assert policy.resets == ["s", "s"]
     assert len(logs[0].source_logs) == 2
     assert logs[0].results.errored_trials == 1
+
+
+def test_controller_timeout_does_not_trigger_policy_retry(tmp_path: Path) -> None:
+    """Only a failure from policy inference may be retried automatically."""
+    from typing import Any
+
+    from inspect_robots.policy import Policy
+    from inspect_robots.types import Action
+
+    class _TimeoutController:
+        def next_action(
+            self, policy: Policy, observation: Observation, t: int, store: dict[str, Any]
+        ) -> Action:
+            del policy, observation, t, store
+            raise TimeoutError("controller scheduler stalled")
+
+    policy = _RecordingTransientPolicy()
+    success, logs = eval_set(
+        _task(),
+        policy,
+        CubePickEmbodiment(),
+        controller=_TimeoutController(),
+        retry_attempts=1,
+        log_dir=str(tmp_path),
+    )
+    assert success is False
+    assert policy.resets == ["s0", "s1"]
+    assert all(sample.retryable_error is False for sample in logs[0].samples)
+    assert len(logs[0].source_logs) == 1
 
 
 @pytest.mark.parametrize("halt", ["safety", "fault"])

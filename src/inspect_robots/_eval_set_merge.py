@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import replace
+from math import isfinite
 from statistics import mean
 
 from inspect_robots.errors import ConfigError
@@ -50,7 +51,7 @@ def _merge_task(task: Task, attempts: Sequence[tuple[EvalLog, str]]) -> EvalLog:
         values = [
             sample.reduced[scorer.name] for sample in samples if scorer.name in sample.reduced
         ]
-        if values:
+        if values and all(isinstance(value, int | float) and isfinite(value) for value in values):
             metrics[scorer.name] = mean(values)
     incomplete = [
         scene
