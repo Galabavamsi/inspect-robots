@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from inspect_robots.embodiment import Embodiment
 from inspect_robots.errors import ConfigError
 from inspect_robots.log import read_eval_log
@@ -19,6 +21,15 @@ from inspect_robots.policy import Policy
 from inspect_robots.task import Task
 
 _CHECKPOINT_VERSION = 1
+
+
+def _identity_json_default(value: object) -> object:
+    """Normalize the array bounds and string sets in component descriptions."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, frozenset):
+        return sorted(value)
+    raise TypeError(f"unsupported checkpoint identity value: {type(value).__name__}")
 
 
 def _identity(
@@ -46,23 +57,14 @@ def _identity(
         ]
         policy_spec: object = (
             {
-                "name": policy.info.name,
-                "checkpoint": policy.info.checkpoint,
+                "info": asdict(policy.info),
                 "config": asdict(policy.config),
             }
             if not isinstance(policy, str)
             else {"name": policy}
         )
         embodiment_spec: object = (
-            {
-                "name": embodiment.info.name,
-                "environment_id": embodiment.info.environment_id,
-                "environment_revision": embodiment.info.environment_revision,
-                "control_hz": embodiment.info.control_hz,
-                "is_simulated": embodiment.info.is_simulated,
-            }
-            if not isinstance(embodiment, str)
-            else {"name": embodiment}
+            asdict(embodiment.info) if not isinstance(embodiment, str) else {"name": embodiment}
         )
         raw = {
             "tasks": task_specs,
@@ -74,7 +76,9 @@ def _identity(
         }
         # Normalize mappings/tuples to JSON values and reject objects or NaN
         # that cannot be compared reliably on a later invocation.
-        return json.loads(json.dumps(raw, sort_keys=True, allow_nan=False))  # type: ignore[no-any-return]
+        return json.loads(  # type: ignore[no-any-return]
+            json.dumps(raw, sort_keys=True, allow_nan=False, default=_identity_json_default)
+        )
     except (TypeError, ValueError, OverflowError, AttributeError) as exc:
         raise ConfigError(f"checkpoint identity must be JSON serializable: {exc}") from exc
 

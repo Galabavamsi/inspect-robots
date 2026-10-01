@@ -602,6 +602,68 @@ def test_eval_set_checkpoint_mismatch_fails_before_robot_reset(tmp_path: Path) -
     assert embodiment.resets == 0
 
 
+def test_checkpoint_rejects_changed_spaces_before_robot_reset(tmp_path: Path) -> None:
+    """A reused scene needs the same robot limits and policy observations."""
+    from dataclasses import replace
+
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.spaces import ObservationSpace
+
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    eval_set(
+        _task(),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+
+    class _ResetSpy(CubePickEmbodiment):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resets = 0
+
+        def reset(self, scene: Scene, *, seed: int | None = None):  # type: ignore[no-untyped-def]
+            self.resets += 1
+            return super().reset(scene, seed=seed)
+
+    changed_robot = _ResetSpy()
+    assert changed_robot.info.action_space.low is not None
+    changed_robot.info = replace(
+        changed_robot.info,
+        action_space=replace(
+            changed_robot.info.action_space,
+            low=changed_robot.info.action_space.low * 2,
+        ),
+    )
+    with pytest.raises(ConfigError, match="checkpoint identity"):
+        eval_set(
+            _task(),
+            ScriptedPolicy(),
+            changed_robot,
+            checkpoint_path=str(checkpoint),
+            log_dir=str(log_dir),
+        )
+    assert changed_robot.resets == 0
+
+    changed_policy = ScriptedPolicy()
+    changed_policy.info = replace(
+        changed_policy.info,
+        observation_space=ObservationSpace(state_keys=frozenset({"eef_pos"})),
+    )
+    same_robot = _ResetSpy()
+    with pytest.raises(ConfigError, match="checkpoint identity"):
+        eval_set(
+            _task(),
+            changed_policy,
+            same_robot,
+            checkpoint_path=str(checkpoint),
+            log_dir=str(log_dir),
+        )
+    assert same_robot.resets == 0
+
+
 @pytest.mark.parametrize("attempts", [-1, True, 1.5])
 def test_eval_set_rejects_invalid_retry_budget(attempts: object, tmp_path: Path) -> None:
     """A malformed retry budget cannot silently alter hardware run length."""
@@ -920,3 +982,32 @@ def test_eval_set_rejects_unserializable_checkpoint_inputs_before_rollout(tmp_pa
             log_dir=str(tmp_path / "logs"),
         )
     assert not checkpoint.exists()
+
+
+def test_resumed_aggregate_json_retains_mixed_attempt_frames(tmp_path: Path) -> None:
+    """A saved aggregate reads back with two selected frame roots and source logs."""
+    from inspect_robots.log import read_eval_log
+
+    log_dir = tmp_path / "logs"
+    success, logs = eval_set(
+        _task(),
+        _RecordingTransientPolicy(),
+        CubePickEmbodiment(),
+        checkpoint_path=str(tmp_path / "run.json"),
+        retry_attempts=1,
+        store_frames=True,
+        log_dir=str(log_dir),
+    )
+    assert success is True
+    roots = {sample.frames_dir for sample in logs[0].samples}
+    assert len(roots) == 2
+    assert None not in roots
+    assert all(Path(root).is_dir() for root in roots if root is not None)
+    saved_aggregates = [
+        read_eval_log(str(path))
+        for path in log_dir.glob("*.json")
+        if read_eval_log(str(path)).source_logs
+    ]
+    assert len(saved_aggregates) == 1
+    assert saved_aggregates[0].source_logs == logs[0].source_logs
+    assert {sample.frames_dir for sample in saved_aggregates[0].samples} == roots

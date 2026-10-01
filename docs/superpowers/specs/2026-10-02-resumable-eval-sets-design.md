@@ -8,7 +8,7 @@ The default call with `retry_attempts=0` and no checkpoint keeps its current beh
 
 ## User contract:
 
-- `eval_set(..., checkpoint_path: str | None = None, retry_attempts: int = 0)` validates `retry_attempts` as a non-boolean integer at least zero. `retry_attempts` is the number of additional attempts allowed for each scene during this invocation. It applies with or without a checkpoint.
+- `eval_set(..., checkpoint_path: str | None = None, retry_attempts: int = 0, checkpoint_inputs: Mapping[str, object] | None = None)` validates `retry_attempts` as a non-boolean integer at least zero. `retry_attempts` is the number of additional attempts allowed for each scene during this invocation. It applies with or without a checkpoint.
 - `inspect-robots eval-set --checkpoint PATH` creates a checkpoint if `PATH` does not exist and resumes it if it does. The same path is used on later invocations. The CLI prints the path and states which scenes were reused and attempted. A mismatch, including a different `log_dir`, fails before any `reset()` or `step()`.
 - A scene is reusable only when its saved `SceneResult.status` is `"success"` and it has the task's planned number of epochs. A zero score is still a completed scene. An errored, cancelled, or never reached scene is not reusable.
 - An explicit later invocation retries all unfinished scenes. Within one invocation, automatic retries apply only to scenes whose last failure is marked retryable. A user interrupt is never retried. `SafetyAbort`, `EmbodimentFault`, configuration and compatibility errors, scorer failures, reducer failures, and malformed policy actions are never retried automatically.
@@ -17,7 +17,7 @@ The default call with `retry_attempts=0` and no checkpoint keeps its current beh
 
 ## Checkpoint and identity:
 
-The checkpoint is an atomic JSON manifest with its own schema version. It records the ordered task slots, their scene IDs and serializable scene declarations, epoch count and reducer, scorer names, horizon, selected policy and embodiment names and recorded configurations, seed, grader identity, and run options that change scoring or artifacts. Each attempt entry names its task slot, selected scene IDs, immutable `EvalLog` file, and completion time. Paths are relative to the manifest when possible. Existing attempt files are never rewritten.
+The checkpoint is an atomic JSON manifest with its own schema version. Caller supplied `checkpoint_inputs` and the CLI constructor arguments and guardrail settings are compared by a SHA-256 digest so their raw values are not written to the manifest. It records the ordered task slots, their scene IDs and serializable scene declarations, epoch count and reducer, scorer names, horizon, the full published policy and embodiment descriptions (including action and observation spaces), policy configuration, seed, grader identity, and run options that change scoring or artifacts. Each attempt entry names its task slot, selected scene IDs, immutable `EvalLog` file, and completion time. Paths are relative to the manifest when possible. Existing attempt files are never rewritten.
 
 A checkpoint uses one writer at a time. Creating it takes an exclusive sibling lock file; a second process fails with a message identifying the lock. A stale lock requires an operator to verify that the former process stopped before removing it. Manifest publication writes a temporary file, flushes and syncs it, then replaces the old manifest. The manifest changes only after its referenced attempt log is durable.
 

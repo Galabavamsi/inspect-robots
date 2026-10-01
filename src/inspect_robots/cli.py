@@ -2177,6 +2177,7 @@ def _render_log_page(
         refresh_seconds=refresh_seconds,
         no_video=no_video,
         serve_pass=serve_pass,
+        include_scene_frames=not no_frames,
     )
     if atomic and out_path is not None:
         return _write_html_atomic(document, out_path)
@@ -2710,25 +2711,57 @@ def _cmd_video(args: argparse.Namespace) -> int:
         frames_dir_candidates,
         resolve_frames_dir,
     )
+    from inspect_robots.frames import _safe
 
     log = read_eval_log(args.log)
     frames_dir = log.stats.frames_dir
-    if frames_dir is None:
+    scene_sources = any(
+        scene.frames_dir is not None and scene.frames_dir != frames_dir for scene in log.samples
+    )
+    if frames_dir is None and not scene_sources:
         raise SystemExit("this log has no stored frames (re-run with --store-frames)")
     log_path = Path(args.log)
-    root = resolve_frames_dir(frames_dir, log_path)
-    if root is None:
-        as_is, fallback = frames_dir_candidates(frames_dir, log_path)
-        raise SystemExit(f"frames directory not found; tried {as_is} and {fallback}")
-
-    streams, strays = discover_streams(root)
+    if scene_sources:
+        streams: dict[str, list[tuple[int, Path]]] = {}
+        strays: list[Path] = []
+        scanned: dict[Path, dict[str, list[tuple[int, Path]]]] = {}
+        for scene in log.samples:
+            source = scene.frames_dir or frames_dir
+            if source is None:
+                continue
+            root = resolve_frames_dir(source, log_path)
+            if root is None:
+                as_is, fallback = frames_dir_candidates(source, log_path)
+                raise SystemExit(f"frames directory not found; tried {as_is} and {fallback}")
+            if root not in scanned:
+                discovered, skipped = discover_streams(root)
+                scanned[root] = discovered
+                strays.extend(skipped)
+            for epoch in range(len(scene.epochs)):
+                marker = f"{_safe(f'{scene.scene_id}-e{epoch}')}_"
+                streams.update(
+                    (prefix, frames)
+                    for prefix, frames in scanned[root].items()
+                    if prefix.startswith(marker)
+                )
+        default_out = log_path.parent / "videos" / log_path.stem
+        empty_source = "selected scenes"
+    else:
+        assert frames_dir is not None
+        root = resolve_frames_dir(frames_dir, log_path)
+        if root is None:
+            as_is, fallback = frames_dir_candidates(frames_dir, log_path)
+            raise SystemExit(f"frames directory not found; tried {as_is} and {fallback}")
+        streams, strays = discover_streams(root)
+        default_out = root
+        empty_source = str(root)
     for stray in strays:
         print(
             f"warning: skipping {stray.name}: does not match the frame filename pattern",
             file=sys.stderr,
         )
     if not streams:
-        raise SystemExit(f"no frames found in {root}")
+        raise SystemExit(f"no frames found in {empty_source}")
 
     if args.fps is not None:
         if not (math.isfinite(args.fps) and args.fps > 0):
@@ -2750,7 +2783,7 @@ def _cmd_video(args: argparse.Namespace) -> int:
             )
         ffmpeg = which
 
-    out_dir = root if args.out is None else Path(args.out)
+    out_dir = default_out if args.out is None else Path(args.out)
     if out_dir.exists() and not out_dir.is_dir():
         raise SystemExit(f"--out {out_dir} exists and is not a directory")
     out_dir.mkdir(parents=True, exist_ok=True)

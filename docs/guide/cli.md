@@ -490,11 +490,46 @@ still run. A `SafetyAbort` or `EmbodimentFault` that escapes `eval()` (raised
 outside a trial) and `KeyboardInterrupt` still propagate. A halt inside a
 trial ends that task with an error log and the set continues to the next task.
 
-`--retry-attempts` is accepted and threaded through to `eval_set()`, whose
-resumption-of-a-partial-run behavior is reserved for a follow-up: passing it
-today does not yet skip already-finished scenes. `--rerun`'s live viewer
-is not offered for `eval-set`: streaming several back-to-back tasks into one
-viewer window is a separate design question from running the set at all.
+Use an explicit checkpoint path to resume a long evaluation set:
+
+```bash
+inspect-robots eval-set 'kitchenbench/*' --policy xpolicylab \
+  -P url=ws://host:19000 --embodiment yam_arms \
+  --log-dir logs/kitchenbench --checkpoint checkpoints/kitchenbench.json \
+  --retry-attempts 2
+```
+
+The first call creates the checkpoint. Repeating the command with the same
+path reuses scenes whose saved status is `success` and whose planned epochs
+all finished. A score of zero still counts as completed work. The CLI reports
+how many scenes it reused and attempted. Keep the checkpoint outside the log
+directory so `inspect-robots view LOG_DIR` sees only evaluation logs.
+
+`--retry-attempts N` permits up to N additional attempts for each scene during
+the current call, with or without a checkpoint. Automatic retries apply only
+to `PolicyError(retryable=True)`, including policy connection and timeout
+failures wrapped by the rollout. Each retry starts that scene at epoch zero
+with the same seed. Ordinary policy errors, malformed actions, scorer errors,
+safety aborts, embodiment faults, and Ctrl-C do not trigger an automatic
+retry. A later explicit call with the same checkpoint attempts any unfinished
+scene, including one that was not eligible for automatic retry.
+
+The checkpoint contains paths to immutable attempt logs. The returned and
+saved aggregate log lists them in `source_logs` and selects one result per
+scene. The checkpoint matches task declarations, published policy and embodiment
+descriptions (including their spaces and capabilities), seed,
+`log_dir`, scoring and artifact options, and the CLI's resolved constructor
+arguments and guardrail settings. Constructor arguments and caller supplied
+`checkpoint_inputs` are recorded as a digest, not as raw values. For API
+calls, pass `checkpoint_inputs={"rig_revision": "..."}` to include settings
+that the framework cannot inspect. Keep external model weights, policy
+servers, and rig calibration consistent across calls. A changed model or
+hardware state outside the recorded inputs cannot be detected automatically.
+
+Only one process can write a checkpoint at a time. If a process dies and
+leaves the sibling `.lock` file, verify that it has stopped before removing
+the lock. A hard kill before an attempt log is written cannot recover that
+in-progress attempt. `--rerun` remains a `run`-only option.
 
 ## `inspect-robots doctor`
 
@@ -664,7 +699,10 @@ wrote 2/2 streams
 Encoding is done by the `ffmpeg` binary (no Python dependencies are added);
 install it from your package manager, or point at a specific build with
 `--ffmpeg PATH`. Videos land in the frames directory by default (`--out DIR`
-overrides). The playback rate defaults to the log's `control_hz` and can be
+overrides). For a resumed aggregate whose scenes came from different
+attempts, videos land under `LOG_DIR/videos/LOG_STEM/` by default. The
+command reads only the selected scene trials from their recorded frame
+roots. The playback rate defaults to the log's `control_hz` and can be
 overridden with `--fps N`. A stream that fails to encode is reported on
 stderr and the remaining streams still encode; the exit code is 1 if any
 stream failed.

@@ -2041,8 +2041,10 @@ def test_view_frames_budget_is_forwarded_as_decimal_megabytes(
         refresh_seconds: int | None = None,
         no_video: bool = False,
         serve_pass: bool = False,
+        include_scene_frames: bool = True,
     ) -> str:
         del (
+            include_scene_frames,
             log,
             title,
             frames_dir,
@@ -2100,8 +2102,10 @@ def test_view_live_frames_budget_matrix(
         refresh_seconds: int | None,
         no_video: bool,
         serve_pass: bool,
+        include_scene_frames: bool = True,
     ) -> str:
         del (
+            include_scene_frames,
             rendered_log,
             title,
             log_path,
@@ -2526,6 +2530,7 @@ def test_view_directory_incremental_mtime_and_force(
         refresh_seconds: int | None = None,
         no_video: bool = False,
         serve_pass: bool = False,
+        include_scene_frames: bool = True,
     ) -> str:
         calls.append(log.eval.created)
         return render_html(
@@ -2539,6 +2544,7 @@ def test_view_directory_incremental_mtime_and_force(
             refresh_seconds=refresh_seconds,
             no_video=no_video,
             serve_pass=serve_pass,
+            include_scene_frames=include_scene_frames,
         )
 
     monkeypatch.setattr(cli, "render_html", record_render)
@@ -8271,3 +8277,23 @@ def test_cli_checkpoint_rejects_changed_guardrail_limit(tmp_path: Path) -> None:
     assert main([*args, "--max-action-delta", "0.1"]) == 0
     with pytest.raises(ConfigError, match="checkpoint identity"):
         main([*args, "--max-action-delta", "0.05"])
+
+
+def test_cli_view_can_hide_resumed_scene_frames(tmp_path: Path) -> None:
+    """The no-frames switch applies to scene-local aggregate frame roots."""
+    from inspect_robots.log import read_eval_log
+
+    path, frames_dir = _write_view_frame_fixture(tmp_path)
+    log = read_eval_log(str(path))
+    scene = dataclasses.replace(log.samples[0], frames_dir=str(frames_dir))
+    aggregate = dataclasses.replace(
+        log,
+        stats=dataclasses.replace(log.stats, frames_dir=None),
+        samples=(scene,),
+    )
+    path.write_text(json.dumps(aggregate.to_dict()))
+
+    assert main(["view", str(path), "--no-video"]) == 0
+    assert 'src="data:image/png;base64,' in path.with_suffix(".html").read_text()
+    assert main(["view", str(path), "--no-frames"]) == 0
+    assert 'src="data:image/png;base64,' not in path.with_suffix(".html").read_text()
