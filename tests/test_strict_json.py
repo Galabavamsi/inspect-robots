@@ -109,6 +109,53 @@ def test_inf_metric_written_as_null(tmp_path: Path) -> None:
     assert metrics["min_distance_to_goal"] is None  # inf → null at the JSON boundary
 
 
+def test_json_sink_never_overwrites_a_colliding_log_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reused random suffix cannot replace an earlier immutable attempt log."""
+    from types import SimpleNamespace
+
+    from inspect_robots.logging.json_log import JsonLogSink
+
+    (log,) = eval(_task(), ScriptedPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path))
+    monkeypatch.setattr(
+        "inspect_robots.logging.json_log.uuid.uuid4",
+        lambda: SimpleNamespace(hex="a" * 32),
+    )
+    sink = JsonLogSink(str(tmp_path))
+    sink.on_eval_end(log)
+    assert sink.path is not None
+    saved_path = sink.path
+    saved_path.write_text("previous immutable log")
+
+    with pytest.raises(FileExistsError):
+        sink.on_eval_end(log)
+    assert saved_path.read_text() == "previous immutable log"
+    assert vars(sink)["path"] is None
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_json_sink_preserves_another_writers_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A temp-name collision cannot unlink a different writer's pending log."""
+    from types import SimpleNamespace
+
+    from inspect_robots.logging.json_log import JsonLogSink
+
+    (log,) = eval(_task(), ScriptedPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path))
+    monkeypatch.setattr(
+        "inspect_robots.logging.json_log.uuid.uuid4",
+        lambda: SimpleNamespace(hex="b" * 32),
+    )
+    pending = tmp_path / f"strict-json_{'b' * 32}.json.tmp"
+    pending.write_text("another writer's pending log")
+    sink = JsonLogSink(str(tmp_path))
+    sink.on_eval_end(log)
+    assert pending.read_text() == "another writer's pending log"
+    assert sink.path is not None and sink.path.exists()
+
+
 def test_nan_action_halts_as_safety_abort_and_log_reaches_disk(tmp_path: Path) -> None:
     embodiment = CubePickEmbodiment()
     approver = _NaNApprover()

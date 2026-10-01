@@ -1,7 +1,7 @@
 """The canonical JSON eval-log sink.
 
 Writes the immutable [`EvalLog`][inspect_robots.log.EvalLog] to ``log_dir`` once the run
-finishes. The write is atomic (temp file + ``os.replace``) so an interrupted
+finishes. The write is atomic (synced temp file + exclusive hard link) so an interrupted
 overnight run never leaves a half-written log.
 
 The file is strict RFC 8259 JSON: non-finite floats (``nan``, ``±inf``, e.g. a
@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import tempfile
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -31,7 +32,7 @@ if TYPE_CHECKING:
     from inspect_robots.types import Action, Observation, StepResult
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
-# Leaves room for the filename's "_" + 8 hex chars + ".json.tmp" suffix inside a
+# Leaves room for the filename's "_" + 32 hex chars + ".json.tmp" suffix inside a
 # 255-byte name, with headroom for filesystems that allow less.
 _SLUG_MAX = 200
 
@@ -94,11 +95,21 @@ class JsonLogSink:
     def on_eval_end(self, log: EvalLog) -> None:
         """Atomically serialize the final log and expose its path."""
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{_slug(log.eval.task)}_{uuid.uuid4().hex[:8]}.json"
-        self.path = self.log_dir / filename
-        tmp = self.path.with_suffix(".json.tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(_sanitize(log.to_dict()), fh, indent=2, sort_keys=True, allow_nan=False)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, self.path)
+        self.path = None
+        filename = f"{_slug(log.eval.task)}_{uuid.uuid4().hex}.json"
+        destination = self.log_dir / filename
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f"{_slug(log.eval.task)}_", suffix=".json.tmp", dir=self.log_dir
+        )
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(_sanitize(log.to_dict()), fh, indent=2, sort_keys=True, allow_nan=False)
+                fh.flush()
+                os.fsync(fh.fileno())
+            # Linking a complete temp file publishes it atomically and refuses
+            # to replace an existing immutable log if names ever collide.
+            os.link(tmp, destination)
+        finally:
+            tmp.unlink(missing_ok=True)
+        self.path = destination
