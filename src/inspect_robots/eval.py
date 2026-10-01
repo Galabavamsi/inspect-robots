@@ -289,6 +289,7 @@ def eval(
     environment_id: str | None = None,
     environment_revision: str | None = None,
     policy_checkpoint: str | None = None,
+    _policy_prebound: bool = False,
 ) -> list[EvalLog]:
     """Run ``task`` with ``policy`` on ``embodiment``; return ``[EvalLog]``.
 
@@ -399,6 +400,7 @@ def eval(
             environment_id=environment_id,
             environment_revision=environment_revision,
             policy_checkpoint=policy_checkpoint,
+            policy_prebound=_policy_prebound,
         )
     finally:
         # Close what we opened: a registry-resolved embodiment is released even
@@ -427,6 +429,7 @@ def _run_eval(
     environment_id: str | None = None,
     environment_revision: str | None = None,
     policy_checkpoint: str | None = None,
+    policy_prebound: bool = False,
 ) -> list[EvalLog]:
     """The body of [`eval`][inspect_robots.eval.eval], after resolution/ownership."""
     from inspect_robots.logging.json_log import JsonLogSink
@@ -437,9 +440,10 @@ def _run_eval(
     # runs before the compatibility check so the policy can adopt the
     # embodiment's spaces. Duck-typed — bind is not part of the Policy
     # Protocol, so existing policies are untouched.
-    bind = getattr(policy, "bind", None)
-    if callable(bind):
-        bind(embodiment.info)
+    if not policy_prebound:
+        bind = getattr(policy, "bind", None)
+        if callable(bind):
+            bind(embodiment.info)
 
     # Fail fast on incompatible pairings before touching any hardware/sim.
     # This also validates the embodiment rate needed by a seconds-based task
@@ -1092,15 +1096,24 @@ def _resumable_eval_set(
     if checkpoint is not None and (isinstance(policy, str) or isinstance(embodiment, str)):
         # Resolve registry components even when every scene is already complete.
         # Otherwise a changed factory could reuse scores without ever being opened.
-        resolved_policy = (
-            cast(Policy, resolve("policy", policy)) if isinstance(policy, str) else policy
-        )
-        owns_embodiment = isinstance(embodiment, str)
-        resolved_embodiment: Embodiment
-        if isinstance(embodiment, str):
-            resolved_embodiment = cast(Embodiment, resolve("embodiment", embodiment))
-        else:
-            resolved_embodiment = embodiment
+        try:
+            resolved_policy = (
+                cast(Policy, resolve("policy", policy)) if isinstance(policy, str) else policy
+            )
+            owns_embodiment = isinstance(embodiment, str)
+            resolved_embodiment = (
+                cast(Embodiment, resolve("embodiment", embodiment))
+                if isinstance(embodiment, str)
+                else embodiment
+            )
+        except (SafetyAbort, EmbodimentFault):
+            raise
+        except Exception as exc:
+            if checkpoint.exists():
+                raise ConfigError(f"checkpoint component could not resolve: {exc}") from exc
+            return False, [
+                _error_log_for(task, policy, embodiment, seed=seed, exc=exc) for task in task_list
+            ]
         try:
             return _resumable_eval_set(
                 task_list,
@@ -1127,7 +1140,7 @@ def _resumable_eval_set(
                 resolved_embodiment.close()
     if checkpoint is not None:
         # Adaptive policies publish their actual spaces only after binding to
-        # the robot. eval() binds again before each attempt; bind is idempotent.
+        # the robot. Each attempt skips rebinding this already identified policy.
         bind = getattr(policy, "bind", None)
         if callable(bind):
             bind(cast(Embodiment, embodiment).info)
@@ -1243,6 +1256,7 @@ def _resumable_eval_set(
                         operator_input=operator_input,
                         grader=grader,
                         before_scoring=None if grader is not None else before_scoring,
+                        _policy_prebound=manifest is not None,
                     )
                 except KeyboardInterrupt:
                     if manifest is not None and json_sink.path is not None:

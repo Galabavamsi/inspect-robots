@@ -533,9 +533,9 @@ calls, pass `checkpoint_inputs={"rig_revision": "..."}` to include settings
 that the framework cannot inspect. Keep external model weights, policy
 servers, and rig calibration consistent across calls. A changed model or
 hardware state outside the recorded inputs cannot be detected automatically.
-Custom scorers can provide a JSON-serializable `checkpoint_identity()` method
-to identify stable settings; otherwise the framework uses their dataclass
-fields or instance attributes.
+Custom scorers that are not dataclasses must provide a JSON-serializable
+`checkpoint_identity()` method to identify stable settings. Dataclass scorers
+use their fields by default.
 
 Only one process can write a checkpoint at a time. If a process dies and
 leaves the sibling `.lock` file, verify that it has stopped before removing

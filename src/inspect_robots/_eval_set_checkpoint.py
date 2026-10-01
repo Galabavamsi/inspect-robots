@@ -43,12 +43,7 @@ def _scorer_identity(scorer: Scorer) -> dict[str, str]:
     elif is_dataclass(scorer_object):
         config = asdict(cast(Any, scorer_object))
     else:
-        try:
-            config = vars(scorer)
-        except TypeError as exc:
-            raise ConfigError(
-                f"scorer {scorer.name!r} needs a JSON checkpoint_identity() hook"
-            ) from exc
+        raise ConfigError(f"scorer {scorer.name!r} needs a JSON checkpoint_identity() hook")
     encoded = json.dumps(config, sort_keys=True, allow_nan=False, default=_identity_json_default)
     cls = type(scorer)
     return {

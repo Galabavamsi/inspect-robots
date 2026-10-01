@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from inspect_robots import eval, eval_set
-from inspect_robots.errors import PolicyError, SafetyAbort
+from inspect_robots.errors import EmbodimentFault, PolicyError, SafetyAbort
 from inspect_robots.mock import CubePickEmbodiment, ScriptedPolicy
 from inspect_robots.scene import Scene
 from inspect_robots.scorer import success_at_end
@@ -187,6 +187,37 @@ def test_checkpoint_scorer_hook_and_opaque_scorer_identity(tmp_path: Path) -> No
             log_dir=str(tmp_path),
             options={},
         )
+
+
+def test_checkpoint_rejects_closure_held_scorer_settings(tmp_path: Path) -> None:
+    """Hidden scorer closure values cannot silently reuse earlier scores."""
+    from dataclasses import replace
+
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.rollout import TrialRecord
+    from inspect_robots.scene import Target
+    from inspect_robots.scorer import Score
+
+    def scorer_with_value(value: float):  # type: ignore[no-untyped-def]
+        class _ClosureScorer:
+            name = "closure"
+
+            def __call__(self, record: TrialRecord, target: Target | None) -> Score:
+                del record, target
+                return Score(value=value)
+
+        return _ClosureScorer()
+
+    checkpoint = tmp_path / "run.json"
+    with pytest.raises(ConfigError, match="checkpoint_identity"):
+        eval_set(
+            replace(_task(), scorer=scorer_with_value(0.0)),
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            checkpoint_path=str(checkpoint),
+            log_dir=str(tmp_path / "logs"),
+        )
+    assert not checkpoint.exists()
 
 
 def test_checkpoint_lock_blocks_second_writer(tmp_path: Path) -> None:
@@ -890,6 +921,105 @@ def test_checkpoint_fingerprints_adaptive_policy_after_bind(tmp_path: Path) -> N
     assert fresh_logs[0].source_logs == first_logs[0].source_logs
 
 
+def test_checkpoint_binds_policy_once_across_retry_attempts(tmp_path: Path) -> None:
+    """Identity preflight covers retries without repeating a one-time bind hook."""
+    from inspect_robots.embodiment import EmbodimentInfo
+
+    class _OneBindPolicy(_OneTransientFailure):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bind_calls = 0
+
+        def bind(self, embodiment_info: EmbodimentInfo) -> None:
+            del embodiment_info
+            self.bind_calls += 1
+            if self.bind_calls != 1:
+                raise RuntimeError("bind called twice")
+
+    policy = _OneBindPolicy()
+    success, logs = eval_set(
+        _task(),
+        policy,
+        CubePickEmbodiment(),
+        checkpoint_path=str(tmp_path / "run.json"),
+        log_dir=str(tmp_path / "logs"),
+        retry_attempts=1,
+    )
+    assert success
+    assert policy.bind_calls == 1
+    assert len(logs[0].source_logs) == 2
+
+
+def test_new_checkpoint_preserves_unknown_string_component_error_row(tmp_path: Path) -> None:
+    """An unresolved name on a new run is still reported as an eval-set row."""
+    checkpoint = tmp_path / "run.json"
+    success, logs = eval_set(
+        _task(),
+        "missing-policy",
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        log_dir=str(tmp_path / "logs"),
+    )
+    assert success is False
+    assert logs[0].status == "error"
+    assert "missing-policy" in (logs[0].error or "")
+    assert not checkpoint.exists()
+
+
+def test_existing_checkpoint_rejects_unresolved_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved checkpoint cannot be reused after its component factory vanishes."""
+    from inspect_robots import registry
+    from inspect_robots.errors import ConfigError
+
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    success, _ = eval_set(
+        _task(),
+        "scripted",
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    assert success
+    monkeypatch.delitem(registry._FACTORIES["policy"], "scripted")
+    with pytest.raises(ConfigError, match="checkpoint component could not resolve"):
+        eval_set(
+            _task(),
+            "scripted",
+            CubePickEmbodiment(),
+            checkpoint_path=str(checkpoint),
+            log_dir=str(log_dir),
+        )
+
+
+@pytest.mark.parametrize("error_type", [SafetyAbort, EmbodimentFault])
+def test_checkpoint_component_safety_halt_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[SafetyAbort] | type[EmbodimentFault],
+) -> None:
+    """Factory safety failures propagate before a checkpoint or rollout is made."""
+    from inspect_robots import registry
+
+    def halt_factory() -> ScriptedPolicy:
+        raise error_type("stop")
+
+    registry.registered("policy")
+    monkeypatch.setitem(registry._FACTORIES["policy"], "halting", halt_factory)
+    checkpoint = tmp_path / "run.json"
+    with pytest.raises(error_type):
+        eval_set(
+            _task(),
+            "halting",
+            CubePickEmbodiment(),
+            checkpoint_path=str(checkpoint),
+            log_dir=str(tmp_path / "logs"),
+        )
+    assert not checkpoint.exists()
+
+
 def test_checkpoint_blocks_ambiguous_attempt_after_grading_failure(tmp_path: Path) -> None:
     """A post-step hook failure cannot let a later call replay hidden robot work."""
     from inspect_robots.errors import ConfigError
@@ -946,6 +1076,9 @@ def test_checkpoint_resume_handles_nonfinite_saved_score(tmp_path: Path) -> None
 
     class _NonfiniteScorer:
         name = "nonfinite"
+
+        def checkpoint_identity(self) -> dict[str, object]:
+            return {}
 
         def __call__(self, record: TrialRecord, target: Target | None) -> Score:
             del record, target
