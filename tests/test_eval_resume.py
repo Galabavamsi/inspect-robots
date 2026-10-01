@@ -8,8 +8,8 @@ from unittest.mock import patch
 
 import pytest
 
-from inspect_robots import eval
-from inspect_robots.errors import PolicyError
+from inspect_robots import eval, eval_set
+from inspect_robots.errors import PolicyError, SafetyAbort
 from inspect_robots.mock import CubePickEmbodiment, ScriptedPolicy
 from inspect_robots.scene import Scene
 from inspect_robots.scorer import success_at_end
@@ -424,3 +424,499 @@ def test_merge_requires_real_attempts_and_rejects_foreign_scenes(tmp_path: Path)
     foreign = replace(original.samples[0], scene_id="foreign")
     with pytest.raises(ConfigError, match="unknown scene"):
         _merge_task(task, [(replace(original, samples=(foreign,)), "foreign.json")])
+
+
+class _RecordingTransientPolicy(_OneTransientFailure):
+    """Record scene resets to prove completed work is skipped."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.resets: list[str] = []
+
+    def reset(self, scene: Scene) -> None:
+        self.resets.append(scene.id)
+        super().reset(scene)
+
+
+def test_eval_set_retries_marked_scene_without_replaying_completed_scene(tmp_path: Path) -> None:
+    """One retry repairs only the transient scene, with a durable attempt trail."""
+    from inspect_robots.log import read_eval_log
+
+    policy = _RecordingTransientPolicy()
+    checkpoint = tmp_path / "run.checkpoint.json"
+    log_dir = tmp_path / "logs"
+    success, logs = eval_set(
+        _task(),
+        policy,
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        retry_attempts=1,
+        log_dir=str(log_dir),
+    )
+
+    assert success is True
+    assert policy.resets.count("s0") == 2
+    assert policy.resets.count("s1") == 1
+    assert len(logs[0].source_logs) == 2
+    assert len(json.loads(checkpoint.read_text())["attempts"]) == 2
+    assert logs[0].results.errored_trials == 0
+    assert logs[0].stats.total_steps > 0
+    assert all(read_eval_log(path).eval.seed == 0 for path in logs[0].source_logs)
+
+    again = _RecordingTransientPolicy()
+    success_again, resumed = eval_set(
+        _task(),
+        again,
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        retry_attempts=1,
+        log_dir=str(log_dir),
+    )
+    assert success_again is True
+    assert again.resets == []
+    assert resumed[0].source_logs == logs[0].source_logs
+    assert len(json.loads(checkpoint.read_text())["attempts"]) == 2
+
+
+def test_eval_set_manual_resume_retries_only_unfinished_scene(tmp_path: Path) -> None:
+    """A later invocation retries an incomplete scene even with no automatic budget."""
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    first_policy = _RecordingTransientPolicy()
+    success, logs = eval_set(
+        _task(),
+        first_policy,
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    assert success is False
+    assert len(logs[0].source_logs) == 1
+    assert [scene.id for scene in _task().scenes] == ["s0", "s1"]
+
+    second_policy = _RecordingTransientPolicy()
+    second_policy.failed = True
+    resumed_success, resumed = eval_set(
+        _task(),
+        second_policy,
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    assert resumed_success is True
+    assert second_policy.resets == ["s0"]
+    assert len(resumed[0].source_logs) == 2
+
+
+def test_eval_set_does_not_retry_unmarked_policy_failure(tmp_path: Path) -> None:
+    """An ordinary policy error gets one attempt despite a retry budget."""
+
+    class _NonRetryPolicy(_RecordingTransientPolicy):
+        def act(self, observation: Observation) -> ActionChunk:
+            if not self.failed:
+                self.failed = True
+                raise PolicyError("malformed response")
+            return ScriptedPolicy.act(self, observation)
+
+    policy = _NonRetryPolicy()
+    success, logs = eval_set(
+        _task(), policy, CubePickEmbodiment(), retry_attempts=3, log_dir=str(tmp_path)
+    )
+    assert success is False
+    assert policy.resets == ["s0", "s1"]
+    assert len(logs[0].source_logs) == 1
+
+
+def test_eval_set_seed_none_stays_fixed_across_retry_and_resume(tmp_path: Path) -> None:
+    """Unseeded calls draw once, then reuse that seed from the checkpoint."""
+    from inspect_robots.log import read_eval_log
+
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    success, logs = eval_set(
+        _task(),
+        _RecordingTransientPolicy(),
+        CubePickEmbodiment(),
+        retry_attempts=1,
+        seed=None,
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    assert success is True
+    seeds = {read_eval_log(path).eval.seed for path in logs[0].source_logs}
+    assert len(seeds) == 1
+    recorded_seed = seeds.pop()
+    assert isinstance(recorded_seed, int)
+    assert json.loads(checkpoint.read_text())["identity"]["seed"] == recorded_seed
+
+    again_success, again_logs = eval_set(
+        _task(),
+        _RecordingTransientPolicy(),
+        CubePickEmbodiment(),
+        seed=None,
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    assert again_success is True
+    assert again_logs[0].eval.seed == recorded_seed
+
+
+def test_eval_set_checkpoint_mismatch_fails_before_robot_reset(tmp_path: Path) -> None:
+    """A changed scene declaration must be detected before moving hardware."""
+    from inspect_robots.errors import ConfigError
+
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    eval_set(
+        _task(),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+
+    class _ResetSpy(CubePickEmbodiment):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resets = 0
+
+        def reset(self, scene: Scene, *, seed: int | None = None):  # type: ignore[no-untyped-def]
+            self.resets += 1
+            return super().reset(scene, seed=seed)
+
+    changed = Task(
+        name="resume-demo",
+        scenes=[Scene(id="s0", instruction="changed"), Scene(id="s1", instruction="reach")],
+        scorer=success_at_end(),
+        max_steps=30,
+    )
+    embodiment = _ResetSpy()
+    with pytest.raises(ConfigError, match="checkpoint identity"):
+        eval_set(
+            changed,
+            ScriptedPolicy(),
+            embodiment,
+            checkpoint_path=str(checkpoint),
+            log_dir=str(log_dir),
+        )
+    assert embodiment.resets == 0
+
+
+@pytest.mark.parametrize("attempts", [-1, True, 1.5])
+def test_eval_set_rejects_invalid_retry_budget(attempts: object, tmp_path: Path) -> None:
+    """A malformed retry budget cannot silently alter hardware run length."""
+    from inspect_robots.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="retry_attempts"):
+        eval_set(
+            _task(),
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            retry_attempts=attempts,  # type: ignore[arg-type]
+            log_dir=str(tmp_path),
+        )
+
+
+def test_eval_set_retry_budget_is_bounded_for_repeated_transient_failures(tmp_path: Path) -> None:
+    """One additional attempt means exactly two rollouts for an always failing scene."""
+
+    class _AlwaysTransient(_RecordingTransientPolicy):
+        def act(self, observation: Observation) -> ActionChunk:
+            raise PolicyError("offline", retryable=True)
+
+    task = Task(
+        name="bounded",
+        scenes=[Scene(id="s", instruction="reach")],
+        scorer=success_at_end(),
+        max_steps=30,
+    )
+    policy = _AlwaysTransient()
+    success, logs = eval_set(
+        task, policy, CubePickEmbodiment(), retry_attempts=1, log_dir=str(tmp_path)
+    )
+    assert success is False
+    assert policy.resets == ["s", "s"]
+    assert len(logs[0].source_logs) == 2
+    assert logs[0].results.errored_trials == 1
+
+
+@pytest.mark.parametrize("halt", ["safety", "fault"])
+def test_eval_set_never_retries_halt_class_failure(halt: str, tmp_path: Path) -> None:
+    """A safety abort or hardware fault must end the attempt without auto-advancing."""
+    from inspect_robots.errors import EmbodimentFault, SafetyAbort
+
+    class _HaltPolicy(_RecordingTransientPolicy):
+        def act(self, observation: Observation) -> ActionChunk:
+            if halt == "safety":
+                raise SafetyAbort("stop")
+            raise EmbodimentFault("motor fault")
+
+    task = Task(
+        name="halt",
+        scenes=[Scene(id="s", instruction="reach")],
+        scorer=success_at_end(),
+        max_steps=30,
+    )
+    policy = _HaltPolicy()
+    success, logs = eval_set(
+        task, policy, CubePickEmbodiment(), retry_attempts=3, log_dir=str(tmp_path)
+    )
+    assert success is False
+    assert policy.resets == ["s"]
+    assert len(logs[0].source_logs) == 1
+
+
+def test_eval_set_interrupt_records_partial_attempt_for_manual_resume(tmp_path: Path) -> None:
+    """Ctrl-C publishes the cancelled attempt, then propagates immediately."""
+    from inspect_robots.errors import _CancelledTrial
+    from inspect_robots.log import read_eval_log
+
+    class _InterruptPolicy(_RecordingTransientPolicy):
+        def act(self, observation: Observation) -> ActionChunk:
+            raise KeyboardInterrupt("stop")
+
+    checkpoint = tmp_path / "run.json"
+    task = Task(
+        name="interrupt",
+        scenes=[Scene(id="s", instruction="reach")],
+        scorer=success_at_end(),
+        max_steps=30,
+    )
+    with pytest.raises(_CancelledTrial):
+        eval_set(
+            task,
+            _InterruptPolicy(),
+            CubePickEmbodiment(),
+            checkpoint_path=str(checkpoint),
+            retry_attempts=2,
+            log_dir=str(tmp_path / "logs"),
+        )
+    attempts = json.loads(checkpoint.read_text())["attempts"]
+    assert len(attempts) == 1
+    path = (checkpoint.parent / attempts[0]["log"]).resolve()
+    assert read_eval_log(str(path)).status == "cancelled"
+
+
+def test_eval_set_string_tasks_and_preflight_errors_keep_rows(tmp_path: Path) -> None:
+    """Retry-only mode retains the legacy synthetic row for a bad task name."""
+    from inspect_robots.errors import ConfigError
+
+    success, logs = eval_set(
+        ["missing-task", "cubepick-reach"],
+        "scripted",
+        "cubepick",
+        retry_attempts=1,
+        log_dir=str(tmp_path / "logs"),
+    )
+    assert success is False
+    assert logs[0].status == "error"
+    assert logs[0].eval.task == "missing-task"
+    assert logs[1].status == "success"
+    with pytest.raises(ConfigError, match="could not resolve"):
+        eval_set(
+            "missing-task",
+            "scripted",
+            "cubepick",
+            checkpoint_path=str(tmp_path / "run.json"),
+            log_dir=str(tmp_path / "logs"),
+        )
+
+
+def test_eval_set_checkpoint_handles_multiple_task_slots(tmp_path: Path) -> None:
+    """Attempt references stay attached to their ordered task slot on resume."""
+    from dataclasses import replace
+
+    tasks = [_task(), replace(_task(), name="second-task")]
+    checkpoint = tmp_path / "run.json"
+    first_success, first_logs = eval_set(
+        tasks,
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        log_dir=str(tmp_path / "logs"),
+    )
+    second_success, second_logs = eval_set(
+        tasks,
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        log_dir=str(tmp_path / "logs"),
+    )
+    assert first_success and second_success
+    assert [log.eval.task for log in second_logs] == ["resume-demo", "second-task"]
+    assert [len(log.source_logs) for log in first_logs] == [1, 1]
+    assert [len(log.source_logs) for log in second_logs] == [1, 1]
+    assert [entry["task_index"] for entry in json.loads(checkpoint.read_text())["attempts"]] == [
+        0,
+        1,
+    ]
+
+
+def test_eval_set_reuses_caller_json_sink_for_attempt(tmp_path: Path) -> None:
+    """A supplied canonical sink writes one attempt and remains observable."""
+    from inspect_robots.approver import AutoApprover
+    from inspect_robots.logging import JsonLogSink
+
+    log_dir = tmp_path / "logs"
+    sink = JsonLogSink(str(log_dir))
+    success, logs = eval_set(
+        _task(),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        checkpoint_path=str(tmp_path / "run.json"),
+        log_dir=str(log_dir),
+        sinks=[sink],
+        approver=AutoApprover(),
+    )
+    assert success is True
+    assert sink.path is not None and sink.path.exists()
+    assert len(list(log_dir.glob("*.json"))) == 2
+    assert len(logs[0].source_logs) == 1
+
+
+def test_eval_set_resumable_preflight_error_does_not_lose_good_task(tmp_path: Path) -> None:
+    """A reducer configuration error becomes one row while later tasks still run."""
+    good = _task()
+    bad = Task(
+        name="bad-reducer",
+        scenes=[Scene(id="s", instruction="reach")],
+        scorer=success_at_end(),
+        max_steps=30,
+        epochs=Epochs(count=1, reducer="bogus"),
+    )
+    success, logs = eval_set(
+        [bad, good],
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        retry_attempts=1,
+        log_dir=str(tmp_path),
+    )
+    assert success is False
+    assert logs[0].status == "error"
+    assert logs[0].source_logs == ()
+    assert logs[1].status == "success"
+
+
+def test_eval_set_rejects_empty_checkpoint_path(tmp_path: Path) -> None:
+    """An empty checkpoint path cannot silently become the working directory."""
+    from inspect_robots.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="checkpoint_path"):
+        eval_set(
+            _task(),
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            checkpoint_path="",
+            log_dir=str(tmp_path),
+        )
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt("stop"), SafetyAbort("unsafe")])
+def test_eval_set_pre_rollout_halt_does_not_publish_attempt(
+    error: BaseException, tmp_path: Path
+) -> None:
+    """A halt before log creation propagates and leaves the checkpoint empty."""
+    from inspect_robots.task import TaskEnvelope
+
+    class _PreflightHalt(ScriptedPolicy):
+        def bind_task(self, envelope: TaskEnvelope) -> None:
+            del envelope
+            raise error
+
+    checkpoint = tmp_path / "run.json"
+    with pytest.raises(type(error), match=str(error)):
+        eval_set(
+            _task(),
+            _PreflightHalt(),
+            CubePickEmbodiment(),
+            checkpoint_path=str(checkpoint),
+            log_dir=str(tmp_path / "logs"),
+        )
+    assert json.loads(checkpoint.read_text())["attempts"] == []
+
+
+def test_eval_set_rejects_missing_durable_attempt_log(tmp_path: Path) -> None:
+    """An eval return without a JSON sink write cannot advance a checkpoint."""
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.logging import JsonLogSink
+
+    checkpoint = tmp_path / "run.json"
+    with (
+        patch.object(JsonLogSink, "on_eval_end", lambda self, log: None),
+        pytest.raises(ConfigError, match="durable attempt log"),
+    ):
+        eval_set(
+            _task(),
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            checkpoint_path=str(checkpoint),
+            log_dir=str(tmp_path / "logs"),
+        )
+    assert json.loads(checkpoint.read_text())["attempts"] == []
+
+
+def test_eval_set_persists_attempt_when_later_sink_fails(tmp_path: Path) -> None:
+    """A durable attempt survives a secondary sink error after JSON publication."""
+    from inspect_robots.log import EvalLog
+    from inspect_robots.logging import JsonLogSink
+    from inspect_robots.logging.sink import NullSink
+
+    class _FailingSink(NullSink):
+        def on_eval_end(self, log: EvalLog) -> None:
+            raise RuntimeError("viewer offline")
+
+    checkpoint = tmp_path / "run.json"
+    success, logs = eval_set(
+        _task(),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        log_dir=str(tmp_path / "logs"),
+        sinks=[JsonLogSink(str(tmp_path / "logs")), _FailingSink()],
+    )
+    assert success is False
+    assert logs[0].error is not None and "viewer offline" in logs[0].error
+    assert len(json.loads(checkpoint.read_text())["attempts"]) == 1
+
+
+def test_eval_set_checkpoint_inputs_detect_changed_external_setting(tmp_path: Path) -> None:
+    """A caller supplied adapter setting participates in checkpoint matching."""
+    from inspect_robots.errors import ConfigError
+
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    eval_set(
+        _task(),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        checkpoint_path=str(checkpoint),
+        checkpoint_inputs={"rig_calibration": "revision-a"},
+        log_dir=str(log_dir),
+    )
+    assert "revision-a" not in checkpoint.read_text()
+    with pytest.raises(ConfigError, match="checkpoint identity"):
+        eval_set(
+            _task(),
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            checkpoint_path=str(checkpoint),
+            checkpoint_inputs={"rig_calibration": "revision-b"},
+            log_dir=str(log_dir),
+        )
+
+
+def test_eval_set_rejects_unserializable_checkpoint_inputs_before_rollout(tmp_path: Path) -> None:
+    """Opaque caller settings cannot enter a reproducible checkpoint identity."""
+    from inspect_robots.errors import ConfigError
+
+    checkpoint = tmp_path / "run.json"
+    with pytest.raises(ConfigError, match="checkpoint_inputs"):
+        eval_set(
+            _task(),
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            checkpoint_path=str(checkpoint),
+            checkpoint_inputs={"opaque": object()},
+            log_dir=str(tmp_path / "logs"),
+        )
+    assert not checkpoint.exists()

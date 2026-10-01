@@ -404,8 +404,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--retry-attempts",
         type=int,
         default=0,
-        help="passed through to eval_set(); resumption of a partial run is "
-        "accepted but not yet honored",
+        help="additional attempts per scene for marked transient policy failures",
+    )
+    p_eval_set.add_argument(
+        "--checkpoint",
+        metavar="PATH",
+        help="create or resume this evaluation-set checkpoint",
     )
 
     p_inspect = sub.add_parser("inspect", help="print a saved eval log")
@@ -1418,6 +1422,8 @@ class _ResolvedComponents(NamedTuple):
     embodiment_name: str
     embodiment_source: str
     claim: DeviceClaim
+    policy_kwargs: dict[str, Any] | None = None
+    embodiment_kwargs: dict[str, Any] | None = None
 
 
 def _check_shared_run_conflicts(args: argparse.Namespace) -> None:
@@ -1502,7 +1508,15 @@ def _resolve_components(args: argparse.Namespace, defaults: Defaults) -> _Resolv
         claim.release()
         raise
     return _ResolvedComponents(
-        policy, policy_name, policy_source, embodiment, embodiment_name, embodiment_source, claim
+        policy,
+        policy_name,
+        policy_source,
+        embodiment,
+        embodiment_name,
+        embodiment_source,
+        claim,
+        policy_kvs,
+        embodiment_kvs,
     )
 
 
@@ -1870,6 +1884,16 @@ def _print_eval_set_summary(success: bool, logs: Sequence[EvalLog], log_dir: str
     print(_styled(f"hint: browse all logs: inspect-robots view {log_dir}", _DIM))
 
 
+def _checkpoint_attempt_count(path: Path) -> int:
+    """Count already-published attempt entries for CLI progress reporting."""
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))["attempts"]
+        return len(entries) if isinstance(entries, list) else 0
+    except (OSError, ValueError, KeyError, TypeError):
+        # eval_set() performs authoritative validation before touching a robot.
+        return 0
+
+
 def _cmd_eval_set(args: argparse.Namespace) -> int:
     """Resolve one policy/embodiment once, then drive every matched task through it.
 
@@ -1883,6 +1907,8 @@ def _cmd_eval_set(args: argparse.Namespace) -> int:
     from inspect_robots.logging import JsonLogSink, LiveLogSink
 
     _check_shared_run_conflicts(args)
+    if args.retry_attempts < 0:
+        raise SystemExit("--retry-attempts must be >= 0")
     task_names = _match_tasks(args.tasks)
 
     defaults = load_defaults(os.environ)
@@ -1921,6 +1947,9 @@ def _cmd_eval_set(args: argparse.Namespace) -> int:
         if not args.no_live_log:
             live_sink = LiveLogSink(args.log_dir)
             sinks.append(live_sink)
+        prior_attempts = (
+            _checkpoint_attempt_count(Path(args.checkpoint)) if args.checkpoint is not None else 0
+        )
         try:
             success, logs = eval_set(
                 tasks,
@@ -1935,6 +1964,22 @@ def _cmd_eval_set(args: argparse.Namespace) -> int:
                     args.store_frames if args.store_frames is not None else defaults.store_frames
                 ),
                 retry_attempts=args.retry_attempts,
+                checkpoint_path=args.checkpoint,
+                checkpoint_inputs=(
+                    {
+                        "policy_name": resolved.policy_name,
+                        "policy_kwargs": resolved.policy_kwargs,
+                        "embodiment_name": resolved.embodiment_name,
+                        "embodiment_kwargs": resolved.embodiment_kwargs,
+                        "guardrails_disabled": args.disable_guardrails,
+                        "max_action_delta": args.max_action_delta,
+                        "grader_kwargs": _parse_kvs(args.grader_args),
+                        "sim": args.sim,
+                        "no_prompt": args.no_prompt,
+                    }
+                    if args.checkpoint is not None
+                    else None
+                ),
                 operator_input=operator_input,
                 grader=grader,
             )
@@ -1976,6 +2021,24 @@ def _cmd_eval_set(args: argparse.Namespace) -> int:
                 finally:
                     resolved.claim.release()
     _print_eval_set_summary(success, logs, args.log_dir)
+    if args.checkpoint is not None:
+        checkpoint = Path(args.checkpoint)
+        entries = json.loads(checkpoint.read_text(encoding="utf-8"))["attempts"]
+        attempted = {
+            (entry["task_index"], scene_id)
+            for entry in entries[prior_attempts:]
+            for scene_id in entry["scene_ids"]
+        }
+        reused = sum(
+            1
+            for index, log in enumerate(logs)
+            for sample in log.samples
+            if sample.status == "success"
+            and len(sample.epochs) == tasks[index].epoch_spec.count
+            and (index, sample.scene_id) not in attempted
+        )
+        print(f"{_styled('checkpoint:', _CYAN)} {_styled(args.checkpoint, _DIM)}")
+        print(f"scenes reused: {reused}  scenes attempted: {len(attempted)}")
     return 0 if success else 1
 
 

@@ -8207,3 +8207,67 @@ def test_config_show_displays_the_grader_default(
     out = capsys.readouterr().out
     assert "grader" in out
     assert "vlm" in out
+
+
+def test_cli_eval_set_checkpoint_reuses_completed_scenes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI exposes a stable checkpoint path and reports reused scene work."""
+    checkpoint = tmp_path / "run.checkpoint.json"
+    log_dir = tmp_path / "logs"
+    args = [
+        "eval-set",
+        "cubepick-reach",
+        "--policy",
+        "scripted",
+        "--embodiment",
+        "cubepick",
+        "--no-prompt",
+        "--no-live-log",
+        "--log-dir",
+        str(log_dir),
+        "--checkpoint",
+        str(checkpoint),
+    ]
+
+    assert main(args) == 0
+    first = capsys.readouterr().out
+    assert f"checkpoint: {checkpoint}" in first
+    assert "scenes reused: 0" in first
+    assert "scenes attempted: 4" in first
+    assert len(json.loads(checkpoint.read_text())["attempts"]) == 1
+
+    assert main(args) == 0
+    second = capsys.readouterr().out
+    assert "scenes reused: 4" in second
+    assert "scenes attempted: 0" in second
+    assert len(json.loads(checkpoint.read_text())["attempts"]) == 1
+
+
+def test_cli_eval_set_rejects_negative_retry_budget() -> None:
+    """A negative retry budget exits before resolving a robot."""
+    with pytest.raises(SystemExit, match="--retry-attempts must be >= 0"):
+        main(["eval-set", "cubepick-reach", "--retry-attempts", "-1"])
+
+
+def test_cli_checkpoint_rejects_changed_guardrail_limit(tmp_path: Path) -> None:
+    """Changing an action limit prevents reuse of prior robot trajectories."""
+    from inspect_robots.errors import ConfigError
+
+    args = [
+        "eval-set",
+        "cubepick-reach",
+        "--policy",
+        "scripted",
+        "--embodiment",
+        "cubepick",
+        "--no-prompt",
+        "--no-live-log",
+        "--log-dir",
+        str(tmp_path / "logs"),
+        "--checkpoint",
+        str(tmp_path / "run.json"),
+    ]
+    assert main([*args, "--max-action-delta", "0.1"]) == 0
+    with pytest.raises(ConfigError, match="checkpoint identity"):
+        main([*args, "--max-action-delta", "0.05"])
