@@ -318,3 +318,109 @@ def test_checkpoint_invalid_schema_and_entries_fail_closed(tmp_path: Path) -> No
             pass
         assert not checkpoint.with_name("run.json.lock").exists()
     checkpoint.write_text(json.dumps(original))
+
+
+def test_merge_keeps_first_complete_zero_score_and_task_order(tmp_path: Path) -> None:
+    """A completed scene is retained even if its score is zero and later logs differ."""
+    from dataclasses import replace
+
+    from inspect_robots._eval_set_merge import _merge_task, _pending_scenes
+
+    task = _task()
+    (original,) = eval(task, ScriptedPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path), seed=17)
+    zero = replace(
+        original.samples[0],
+        reduced={"success_at_end": 0.0},
+        epochs=({"success_at_end": 0.0},),
+    )
+    first = replace(
+        original,
+        samples=(original.samples[1], zero),
+        stats=replace(original.stats, duration_s=1.25, total_steps=10),
+    )
+    second = replace(original, stats=replace(original.stats, duration_s=2.5, total_steps=20))
+
+    merged = _merge_task(task, [(first, "attempt-1.json"), (second, "attempt-2.json")])
+
+    assert [sample.scene_id for sample in merged.samples] == ["s0", "s1"]
+    assert merged.samples[0].reduced == {"success_at_end": 0.0}
+    assert merged.results.metrics == {"success_at_end": 0.5}
+    assert merged.results.total_trials == 2
+    assert merged.stats.duration_s == 3.75
+    assert merged.stats.total_steps == 30
+    assert merged.stats.mean_inference_latency_s is None
+    assert merged.stats.frames_dir is None
+    assert merged.source_logs == ("attempt-1.json", "attempt-2.json")
+    assert merged.status == "success"
+    assert _pending_scenes(task, merged) == []
+
+
+def test_merge_replaces_partial_scene_and_keeps_unreached_pending(tmp_path: Path) -> None:
+    """Incomplete scenes use the latest record and stay pending until fully rerun."""
+    from dataclasses import replace
+
+    from inspect_robots._eval_set_merge import _merge_task, _pending_scenes
+
+    task = _task()
+    (original,) = eval(task, ScriptedPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path), seed=17)
+    failed = replace(
+        original.samples[0],
+        status="error",
+        epochs=({},),
+        reduced={},
+        error="PolicyError: offline",
+        errored_trials=1,
+        retryable_error=True,
+    )
+    first = replace(original, status="error", samples=(failed,), error="offline")
+    incomplete = _merge_task(task, [(first, "first.json")])
+    assert incomplete.status == "error"
+    assert incomplete.results.errored_trials == 1
+    assert [scene.id for scene in _pending_scenes(task, incomplete)] == ["s0", "s1"]
+
+    second = replace(original, samples=(original.samples[0],), error=None)
+    merged = _merge_task(task, [(first, "first.json"), (second, "second.json")])
+    assert merged.samples[0].status == "success"
+    assert merged.results.errored_trials == 0
+    assert [scene.id for scene in _pending_scenes(task, merged)] == ["s1"]
+
+
+def test_merge_uses_attempt_frame_root_for_selected_scene(tmp_path: Path) -> None:
+    """A selected scene remembers the source even when only the log has the root."""
+    from dataclasses import replace
+
+    from inspect_robots._eval_set_merge import _merge_task
+
+    task = _task()
+    (original,) = eval(task, ScriptedPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path), seed=17)
+    first = replace(
+        original,
+        samples=(original.samples[0],),
+        stats=replace(original.stats, frames_dir="first-frames"),
+    )
+    second = replace(
+        original,
+        samples=(original.samples[1],),
+        stats=replace(original.stats, frames_dir="second-frames"),
+    )
+    merged = _merge_task(task, [(first, "first.json"), (second, "second.json")])
+    assert [sample.frames_dir for sample in merged.samples] == [
+        "first-frames",
+        "second-frames",
+    ]
+
+
+def test_merge_requires_real_attempts_and_rejects_foreign_scenes(tmp_path: Path) -> None:
+    """A merge cannot fabricate provenance or accept a scene outside the task."""
+    from dataclasses import replace
+
+    from inspect_robots._eval_set_merge import _merge_task
+    from inspect_robots.errors import ConfigError
+
+    task = _task()
+    with pytest.raises(ConfigError, match="without attempt"):
+        _merge_task(task, [])
+    (original,) = eval(task, ScriptedPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path), seed=17)
+    foreign = replace(original.samples[0], scene_id="foreign")
+    with pytest.raises(ConfigError, match="unknown scene"):
+        _merge_task(task, [(replace(original, samples=(foreign,)), "foreign.json")])
