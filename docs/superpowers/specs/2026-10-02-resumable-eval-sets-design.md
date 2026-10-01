@@ -1,0 +1,42 @@
+# Resumable evaluation sets: design
+
+## Purpose:
+
+`eval_set()` accepts `retry_attempts` but currently ignores it. A failure late in a multi-task hardware benchmark makes the operator repeat completed work. This design adds bounded automatic retries for explicitly retryable policy failures and an explicit checkpoint that lets a later invocation reuse completed scenes.
+
+The default call with `retry_attempts=0` and no checkpoint keeps its current behavior. A checkpoint is opt-in. This change stays in the NumPy-only core and does not add a plugin dependency.
+
+## User contract:
+
+- `eval_set(..., checkpoint_path: str | None = None, retry_attempts: int = 0)` validates `retry_attempts` as a non-boolean integer at least zero. `retry_attempts` is the number of additional attempts allowed for each scene during this invocation. It applies with or without a checkpoint.
+- `inspect-robots eval-set --checkpoint PATH` creates a checkpoint if `PATH` does not exist and resumes it if it does. The same path is used on later invocations. The CLI prints the path and states which scenes were reused and attempted. A mismatch, including a different `log_dir`, fails before any `reset()` or `step()`.
+- A scene is reusable only when its saved `SceneResult.status` is `"success"` and it has the task's planned number of epochs. A zero score is still a completed scene. An errored, cancelled, or never reached scene is not reusable.
+- An explicit later invocation retries all unfinished scenes. Within one invocation, automatic retries apply only to scenes whose last failure is marked retryable. A user interrupt is never retried. `SafetyAbort`, `EmbodimentFault`, configuration and compatibility errors, scorer failures, reducer failures, and malformed policy actions are never retried automatically.
+- A new `PolicyError.retryable` boolean is false by default. Policy adapters may mark a known transient failure retryable. The rollout marks recognized connection and timeout failures retryable when wrapping an ordinary policy exception. No decision depends on parsing error text. A scene is auto-retryable only if all errors that made it incomplete were retryable policy errors.
+- Each retry starts its scene again at epoch zero. The run seed and scene initialization seeds remain the same. Recorded seeds reproduce the framework's seed derivation, but external providers and hardware may still be nondeterministic.
+
+## Checkpoint and identity:
+
+The checkpoint is an atomic JSON manifest with its own schema version. It records the ordered task slots, their scene IDs and serializable scene declarations, epoch count and reducer, scorer names, horizon, selected policy and embodiment names and recorded configurations, seed, grader identity, and run options that change scoring or artifacts. Each attempt entry names its task slot, selected scene IDs, immutable `EvalLog` file, and completion time. Paths are relative to the manifest when possible. Existing attempt files are never rewritten.
+
+A checkpoint uses one writer at a time. Creating it takes an exclusive sibling lock file; a second process fails with a message identifying the lock. A stale lock requires an operator to verify that the former process stopped before removing it. Manifest publication writes a temporary file, flushes and syncs it, then replaces the old manifest. The manifest changes only after its referenced attempt log is durable.
+
+`seed=None` resolves to one OS seed at the start of a new checkpoint and reuses that value on all attempts and later invocations. Without a checkpoint, automatic retries also reuse one resolved seed for that invocation. Checkpoint matching compares the recorded identity before rollout. Arbitrary plugin internals cannot be fully fingerprinted, so an explicit checkpoint path is required and the documentation tells the operator to keep the same model checkpoint, rig setup, and external server configuration. Non-JSON task declarations cannot enter checkpoint mode; they fail with `ConfigError` before rollout.
+
+## Execution and logs:
+
+`eval_set` evaluates the unfinished scene subset of each task using the existing `eval()` pipeline and scorer contract. It keeps the original task order and returns one aggregate `EvalLog` per task. An attempt log is saved before the manifest references it, including the partial log written on Ctrl-C. Pre-rollout exceptions still yield an error log for the task and do not trigger automatic retries. Sinks observe each real attempt and do not receive a synthetic second lifecycle for the aggregate.
+
+Successful scene records are chosen from the earliest completed attempt and are never rerun. For an unfinished scene, the latest attempt's record is retained. The aggregate log lists retained scenes in original task order and recomputes metrics from the chosen `SceneResult.reduced` values with the existing per-scene mean rule. A new optional `EvalLog.source_logs` tuple records every attempt-log path for audit. Aggregate `EvalStats.duration_s` and `total_steps` cover every attempt, including discarded retries; `mean_inference_latency_s` is `None` because attempt logs do not store the inference count needed for an exact weighted mean. `total_trials` counts chosen scene records, and `errored_trials` sums a new `SceneResult.errored_trials` field from those records. That field is zero for a successful legacy scene and is set exactly by new attempts. The aggregate succeeds only when every planned scene is complete; otherwise it reports an error and lists only the scenes attempted so far in original task order.
+
+Each real attempt keeps its own frame directory and action or wire sidecars. New optional `SceneResult.frames_dir`, `SceneResult.errored_trials`, and `SceneResult.retryable_error` fields preserve the frame source, exact error count, and retry decision of a scene. An aggregate log sets `frames_dir` for each retained scene. The HTML viewer and `video` command use that source when present and fall back to `EvalStats.frames_dir` for existing logs. Action and wire paths remain relative to the shared `log_dir`. The aggregate log is written in that same directory. Old schema-v1 logs remain readable because new fields have defaults.
+
+A checkpoint manifest and prior attempt logs remain on disk after success. A successful later invocation creates a new aggregate log and updates the manifest pointer without changing the old files. The initial implementation is sequential. If parallel `eval_set` support lands, checkpoint mode rejects `max_workers > 1` until the scheduler can serialize manifest updates.
+
+## Verification:
+
+Use CubePick and injected failures to cover the following: a completed zero-score scene is reused; a partially completed scene is rerun from epoch zero; automatic retries stop at the per-scene limit; a marked transient policy failure retries; malformed actions, scorer errors, hardware faults, safety aborts, and Ctrl-C do not auto retry; `seed=None` stays fixed; changed task or component identity fails before reset; manifest and aggregate JSON read back; frames from different attempts render and export; legacy logs still render. Keep the core at 100% line and branch coverage, then run Ruff check and format, strict mypy, and the full pytest coverage gate.
+
+## Scope:
+
+This design does not promise recovery after an ungraceful process kill before `eval()` has written an attempt log. It does not retry a partially completed epoch, add a cross-process service, or automatically match similar commands to a prior run.
