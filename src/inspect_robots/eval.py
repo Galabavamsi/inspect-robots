@@ -570,6 +570,10 @@ def _run_eval(
                     scene_status = "error"
                     scene_error = f"policy.on_trial_start failed: {exc}"
                     scene_errors_retryable.append(False)
+                    if isinstance(exc, (SafetyAbort, EmbodimentFault)):
+                        halted = True
+                        status = "error"
+                        error = f"{type(exc).__name__}: {exc}"
                     record = TrialRecord(
                         scene_id=scene.id,
                         epoch=epoch,
@@ -723,7 +727,11 @@ def _run_eval(
                             scene_error = (
                                 detail if scene_error is None else f"{scene_error}; {detail}"
                             )
-                            if status == "success":
+                            if isinstance(exc, (SafetyAbort, EmbodimentFault)):
+                                halted = True
+                                status = "error"
+                                error = f"{type(exc).__name__}: {exc}"
+                            elif status == "success":
                                 status = "error"
                                 error = detail
 

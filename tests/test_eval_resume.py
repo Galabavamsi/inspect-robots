@@ -1509,6 +1509,60 @@ def test_eval_set_halt_suppresses_retries_of_earlier_scenes(
     assert logs[0].samples[0].retryable_error is True
 
 
+@pytest.mark.parametrize("error_type", [SafetyAbort, EmbodimentFault])
+@pytest.mark.parametrize("checkpointed", [False, True])
+@pytest.mark.parametrize("phase", ["start", "end"])
+def test_eval_set_lifecycle_halt_stops_epochs_scenes_and_retries(
+    tmp_path: Path,
+    error_type: type[SafetyAbort] | type[EmbodimentFault],
+    checkpointed: bool,
+    phase: str,
+) -> None:
+    """Lifecycle halts block later trials and retries of earlier transient errors."""
+    from inspect_robots.log import read_eval_log
+    from inspect_robots.rollout import TrialRecord
+
+    class _LifecycleHaltPolicy(_RecordingTransientPolicy):
+        def on_trial_start(self, scene_id: str, epoch: int, log_dir: str, run_stamp: str) -> None:
+            del epoch, log_dir, run_stamp
+            if scene_id == "halt" and phase == "start":
+                raise error_type("stop in lifecycle")
+
+        def on_trial_end(self, record: TrialRecord, log_dir: str, run_stamp: str) -> None:
+            del log_dir, run_stamp
+            if record.scene_id == "halt" and phase == "end":
+                raise error_type("stop in lifecycle")
+
+    task = Task(
+        name="lifecycle-halt",
+        scenes=[Scene(id=name, instruction="reach") for name in ["early", "halt", "after"]],
+        scorer=success_at_end(),
+        max_steps=30,
+        epochs=Epochs(count=2),
+    )
+    policy = _LifecycleHaltPolicy()
+    success, logs = eval_set(
+        task,
+        policy,
+        CubePickEmbodiment(),
+        retry_attempts=1,
+        checkpoint_path=str(tmp_path / "run.json") if checkpointed else None,
+        log_dir=str(tmp_path / "logs"),
+    )
+
+    assert success is False
+    assert policy.resets == ["early", "early"] + (["halt"] if phase == "end" else [])
+    assert len(logs[0].source_logs) == 1
+    assert logs[0].halted is True
+    attempt = read_eval_log(logs[0].source_logs[0])
+    assert attempt.halted is True
+    assert [sample.scene_id for sample in attempt.samples] == ["early", "halt"]
+    assert len(attempt.samples[1].epochs) == 1
+    assert attempt.samples[1].status == "error"
+    assert attempt.samples[0].retryable_error is True
+    assert attempt.error is not None and "stop in lifecycle" in attempt.error
+
+
 def test_eval_set_interrupt_records_partial_attempt_for_manual_resume(tmp_path: Path) -> None:
     """Ctrl-C publishes the cancelled attempt, then propagates immediately."""
     from inspect_robots.errors import _CancelledTrial
