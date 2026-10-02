@@ -519,8 +519,9 @@ for automatic retry.
 
 The checkpoint marks an attempt in flight before it starts and clears the mark
 when its log is saved. If a crash or grading-hook error leaves the mark set,
-the next invocation stops before resetting the robot. Inspect the robot and
-attempt files, then start a new checkpoint after reconciling that run.
+the current call stops before scheduling later tasks, and the next invocation
+stops before resetting the robot. Inspect the robot and attempt files, then
+start a new checkpoint after reconciling that run.
 
 The checkpoint contains paths to immutable attempt logs. The returned and
 saved aggregate log lists them in `source_logs` and selects one result per

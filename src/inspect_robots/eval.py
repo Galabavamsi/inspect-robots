@@ -966,6 +966,8 @@ def eval_set(
     identity comparison. Its values are stored only as a SHA-256 digest.
     An attempt without a saved log leaves the checkpoint in flight; a later
     call fails before robot reset so the operator can reconcile the run.
+    That invocation stops immediately and returns only the task logs collected
+    so far, so a later task cannot clear the unresolved attempt's marker.
     """
     before_scoring, resolved_grader = _grading_hook(grader, before_scoring)
     task_list = [tasks] if isinstance(tasks, Task | str) else list(tasks)
@@ -1271,6 +1273,8 @@ def _resumable_eval_set(
                     logs.append(
                         _error_log_for(resolved_task, policy, embodiment, seed=seed, exc=exc)
                     )
+                    if manifest is not None and json_sink.path is None:
+                        return False, logs
                     break
                 if json_sink.path is None:
                     raise ConfigError("eval() returned without a durable attempt log")

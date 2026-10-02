@@ -1066,6 +1066,65 @@ def test_checkpoint_blocks_ambiguous_attempt_after_grading_failure(tmp_path: Pat
     assert second_robot.resets == 0
 
 
+def test_checkpoint_unsaved_attempt_stops_later_tasks(tmp_path: Path) -> None:
+    """Later tasks cannot clear the recovery marker for unrecorded robot motion."""
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.rollout import TrialRecord
+
+    class _ResetSpy(CubePickEmbodiment):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resets: list[str] = []
+
+        def reset(self, scene: Scene, *, seed: int | None = None) -> Observation:
+            self.resets.append(scene.id)
+            return super().reset(scene, seed=seed)
+
+    def failing_grade(_record: TrialRecord, scene: Scene) -> None:
+        if scene.id == "first":
+            raise RuntimeError("grader disconnected after motion")
+
+    tasks = [
+        Task(
+            name=name,
+            scenes=[Scene(id=name, instruction="reach")],
+            scorer=success_at_end(),
+            max_steps=30,
+        )
+        for name in ["first", "later"]
+    ]
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    first_robot = _ResetSpy()
+    success, logs = eval_set(
+        tasks,
+        ScriptedPolicy(),
+        first_robot,
+        before_scoring=failing_grade,
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+
+    assert success is False
+    assert first_robot.resets == ["first"]
+    assert len(logs) == 1 and logs[0].status == "error"
+    manifest = json.loads(checkpoint.read_text())
+    assert manifest["in_flight"] is True
+    assert manifest["attempts"] == []
+
+    second_robot = _ResetSpy()
+    with pytest.raises(ConfigError, match="unfinished attempt"):
+        eval_set(
+            tasks,
+            ScriptedPolicy(),
+            second_robot,
+            before_scoring=failing_grade,
+            checkpoint_path=str(checkpoint),
+            log_dir=str(log_dir),
+        )
+    assert second_robot.resets == []
+
+
 def test_checkpoint_resume_handles_nonfinite_saved_score(tmp_path: Path) -> None:
     """Strict JSON null scores omit an invalid aggregate metric on every call."""
     from dataclasses import replace
@@ -1433,19 +1492,28 @@ def test_eval_set_rejects_missing_durable_attempt_log(tmp_path: Path) -> None:
     assert json.loads(checkpoint.read_text())["attempts"] == []
 
 
-def test_eval_set_persists_attempt_when_later_sink_fails(tmp_path: Path) -> None:
-    """A durable attempt survives a secondary sink error after JSON publication."""
+@pytest.mark.parametrize("include_later_task", [False, True])
+def test_eval_set_persists_attempt_when_later_sink_fails(
+    tmp_path: Path, include_later_task: bool
+) -> None:
+    """A saved attempt survives a sink error and permits remaining tasks to run."""
+    from dataclasses import replace
+
     from inspect_robots.log import EvalLog
     from inspect_robots.logging import JsonLogSink
     from inspect_robots.logging.sink import NullSink
 
     class _FailingSink(NullSink):
         def on_eval_end(self, log: EvalLog) -> None:
-            raise RuntimeError("viewer offline")
+            if log.eval.task == "resume-demo":
+                raise RuntimeError("viewer offline")
 
     checkpoint = tmp_path / "run.json"
+    tasks = [_task()]
+    if include_later_task:
+        tasks.append(replace(_task(), name="later-task"))
     success, logs = eval_set(
-        _task(),
+        tasks,
         ScriptedPolicy(),
         CubePickEmbodiment(),
         checkpoint_path=str(checkpoint),
@@ -1454,7 +1522,11 @@ def test_eval_set_persists_attempt_when_later_sink_fails(tmp_path: Path) -> None
     )
     assert success is False
     assert logs[0].error is not None and "viewer offline" in logs[0].error
-    assert len(json.loads(checkpoint.read_text())["attempts"]) == 1
+    manifest = json.loads(checkpoint.read_text())
+    assert len(manifest["attempts"]) == (2 if include_later_task else 1)
+    assert manifest["in_flight"] is False
+    if include_later_task:
+        assert logs[1].status == "success"
 
 
 def test_eval_set_checkpoint_inputs_detect_changed_external_setting(tmp_path: Path) -> None:
