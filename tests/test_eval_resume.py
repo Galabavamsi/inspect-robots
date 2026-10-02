@@ -220,6 +220,165 @@ def test_checkpoint_rejects_closure_held_scorer_settings(tmp_path: Path) -> None
     assert not checkpoint.exists()
 
 
+def test_checkpoint_rejects_grading_callback_without_declared_identity(tmp_path: Path) -> None:
+    """Opaque grading settings cannot enter a checkpoint that may reuse scores."""
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.rollout import TrialRecord
+
+    def grade(record: TrialRecord, scene: Scene) -> None:
+        del scene
+        record.operator_judgement = "yes"
+
+    checkpoint = tmp_path / "run.json"
+    with pytest.raises(ConfigError, match=r"before_scoring.*checkpoint_identity"):
+        eval_set(
+            _task(),
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            before_scoring=grade,
+            checkpoint_path=str(checkpoint),
+            log_dir=str(tmp_path / "logs"),
+        )
+    assert not checkpoint.exists()
+    assert not (tmp_path / "logs").exists()
+    success, _ = eval_set(
+        _task(),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        before_scoring=grade,
+        retry_attempts=1,
+        log_dir=str(tmp_path / "logs"),
+    )
+    assert success
+
+
+def test_checkpoint_rejects_distinct_grading_functions(tmp_path: Path) -> None:
+    """Changing the grading function cannot reuse an earlier operator score."""
+    from dataclasses import replace
+
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.rollout import TrialRecord
+    from inspect_robots.scorer import operator_scorer
+
+    def grade_success(record: TrialRecord, scene: Scene) -> None:
+        del scene
+        record.operator_judgement = "yes"
+
+    def grade_failure(record: TrialRecord, scene: Scene) -> None:
+        del scene
+        record.operator_judgement = "no"
+
+    for grade in [grade_success, grade_failure]:
+        grade.checkpoint_identity = lambda: {"revision": 1}  # type: ignore[attr-defined]
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    task = replace(_task(), scorer=operator_scorer())
+    success, logs = eval_set(
+        task,
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        before_scoring=grade_success,
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    assert success and logs[0].results.metrics == {"operator": 1.0}
+    with pytest.raises(ConfigError, match="checkpoint identity"):
+        eval_set(
+            task,
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            before_scoring=grade_failure,
+            checkpoint_path=str(checkpoint),
+            log_dir=str(log_dir),
+        )
+    _, fresh_logs = eval_set(
+        task,
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        before_scoring=grade_failure,
+        log_dir=str(log_dir),
+    )
+    assert fresh_logs[0].results.metrics == {"operator": 0.0}
+
+
+@pytest.mark.parametrize("bound_method", [False, True])
+def test_checkpoint_rejects_changed_declared_callback_settings(
+    tmp_path: Path, bound_method: bool
+) -> None:
+    """A callable's hidden grading configuration must participate in identity."""
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.rollout import TrialRecord
+
+    class _Grade:
+        def __init__(self, verdict: str) -> None:
+            self.verdict = verdict
+
+        def checkpoint_identity(self) -> dict[str, str]:
+            return {"verdict": self.verdict}
+
+        def __call__(self, record: TrialRecord, scene: Scene) -> None:
+            self.grade(record, scene)
+
+        def grade(self, record: TrialRecord, scene: Scene) -> None:
+            del scene
+            record.operator_judgement = self.verdict
+
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    grade = _Grade("yes")
+    callback = grade.grade if bound_method else grade
+    first_success, first_logs = eval_set(
+        _task(),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        before_scoring=callback,
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    same_success, same_logs = eval_set(
+        _task(),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        before_scoring=callback,
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    assert first_success and same_success
+    assert first_logs[0].source_logs == same_logs[0].source_logs
+    grade.verdict = "no"
+    with pytest.raises(ConfigError, match="checkpoint identity"):
+        eval_set(
+            _task(),
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            before_scoring=callback,
+            checkpoint_path=str(checkpoint),
+            log_dir=str(log_dir),
+        )
+
+
+def test_checkpoint_rejects_non_json_callback_identity(tmp_path: Path) -> None:
+    """Invalid declared callback settings fail before a checkpoint is created."""
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.rollout import TrialRecord
+
+    def grade(record: TrialRecord, scene: Scene) -> None:
+        del record, scene
+
+    grade.checkpoint_identity = lambda: object()  # type: ignore[attr-defined]
+    checkpoint = tmp_path / "run.json"
+    with pytest.raises(ConfigError, match=r"before_scoring checkpoint_identity.*JSON"):
+        eval_set(
+            _task(),
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            before_scoring=grade,
+            checkpoint_path=str(checkpoint),
+            log_dir=str(tmp_path / "logs"),
+        )
+    assert not checkpoint.exists()
+
+
 def test_checkpoint_lock_blocks_second_writer(tmp_path: Path) -> None:
     """A live writer must prevent another process from mutating the manifest."""
     from inspect_robots._eval_set_checkpoint import _identity, _open_checkpoint
@@ -1037,6 +1196,7 @@ def test_checkpoint_blocks_ambiguous_attempt_after_grading_failure(tmp_path: Pat
     def failing_grade(_record: TrialRecord, _scene: Scene) -> None:
         raise RuntimeError("grader disconnected")
 
+    failing_grade.checkpoint_identity = lambda: {"revision": 1}  # type: ignore[attr-defined]
     checkpoint = tmp_path / "run.json"
     log_dir = tmp_path / "logs"
     first_robot = _ResetSpy()
@@ -1084,6 +1244,7 @@ def test_checkpoint_unsaved_attempt_stops_later_tasks(tmp_path: Path) -> None:
         if scene.id == "first":
             raise RuntimeError("grader disconnected after motion")
 
+    failing_grade.checkpoint_identity = lambda: {"revision": 1}  # type: ignore[attr-defined]
     tasks = [
         Task(
             name=name,

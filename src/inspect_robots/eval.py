@@ -964,6 +964,9 @@ def eval_set(
     to restart their scene during this invocation. Each retry begins at epoch zero.
     ``checkpoint_inputs`` adds caller-specific, JSON-serializable settings to the
     identity comparison. Its values are stored only as a SHA-256 digest.
+    A custom ``before_scoring`` callback in checkpoint mode must declare a JSON
+    ``checkpoint_identity()`` hook on the callable or its bound-method owner.
+    Include its behavior revision and hidden grading settings in that identity.
     An attempt without a saved log leaves the checkpoint in flight; a later
     call fails before robot reset so the operator can reconcile the run.
     That invocation stops immediately and returns only the task logs collected
@@ -1048,14 +1051,16 @@ def _clear_json_sink_path(sink: JsonLogSink) -> None:
     sink.path = None
 
 
-def _checkpoint_inputs_digest(inputs: Mapping[str, object] | None) -> str | None:
+def _checkpoint_inputs_digest(
+    inputs: Mapping[str, object] | None, *, name: str = "checkpoint_inputs"
+) -> str | None:
     """Fingerprint external run settings without storing their raw values."""
     if inputs is None:
         return None
     try:
         encoded = json.dumps(dict(inputs), sort_keys=True, allow_nan=False, separators=(",", ":"))
     except (TypeError, ValueError, OverflowError) as exc:
-        raise ConfigError(f"checkpoint_inputs must be JSON serializable: {exc}") from exc
+        raise ConfigError(f"{name} must be JSON serializable: {exc}") from exc
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -1065,6 +1070,26 @@ def _instance_identity(value: object) -> str | None:
         return None
     cls = type(value)
     return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _callback_identity(value: object) -> dict[str, object] | None:
+    """Require custom grading callbacks to declare hidden settings for reuse."""
+    if value is None:
+        return None
+    owner = getattr(value, "__self__", value)
+    hook = getattr(owner, "checkpoint_identity", None)
+    if not callable(hook):
+        raise ConfigError(
+            "before_scoring needs a JSON checkpoint_identity() hook in checkpoint mode"
+        )
+    return {
+        "type": _instance_identity(value),
+        "module": getattr(value, "__module__", None),
+        "qualname": getattr(value, "__qualname__", None),
+        "config_sha256": _checkpoint_inputs_digest(
+            {"identity": hook()}, name="before_scoring checkpoint_identity()"
+        ),
+    }
 
 
 def _resumable_eval_set(
@@ -1175,7 +1200,11 @@ def _resumable_eval_set(
         "controller": _instance_identity(controller),
         "approver": _instance_identity(approver),
         "operator_input": _instance_identity(operator_input),
-        "before_scoring": _instance_identity(before_scoring),
+        "before_scoring": (
+            _callback_identity(before_scoring)
+            if checkpoint is not None and grader is None
+            else None
+        ),
         "checkpoint_inputs_sha256": (
             _checkpoint_inputs_digest(checkpoint_inputs) if checkpoint is not None else None
         ),

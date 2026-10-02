@@ -542,6 +542,13 @@ Custom scorers that are not dataclasses must provide a JSON-serializable
 `checkpoint_identity()` method to identify stable settings. Dataclass scorers
 use their fields by default.
 
+In checkpointed API calls, custom `before_scoring` callbacks must provide a
+JSON-serializable `checkpoint_identity()` hook on the callable or its bound
+method's owner. Include the callback's behavior revision and all hidden grading
+settings. The checkpoint compares the callback's module, qualified name, and
+declared settings digest before reusing scores. Calls without a checkpoint do
+not require this hook.
+
 Only one process can write a checkpoint at a time. If a process dies and
 leaves the sibling `.lock` file, verify that it has stopped before removing
 the lock. A hard kill before an attempt log is written cannot automatically
