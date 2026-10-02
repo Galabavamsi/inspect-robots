@@ -16,6 +16,8 @@ All notable changes to this project are documented here. The format is based on
   and activates `--retry-attempts`. Safety and hardware halts stop automatic
   task retries, and unsaved checkpoint attempts stop the set
   ([#136](https://github.com/robocurve/inspect-robots/issues/136)).
+  Custom grading callbacks declare their checkpoint identity, and final JSON
+  publication protects collisions on filesystems with or without hard links.
 
 - **Agent plugin (0.28.0):** Accept `-P service_tier=ultrafast` on the Responses wire
   for OpenAI Ultrafast mode, with a mock-embodiment example for API testing.

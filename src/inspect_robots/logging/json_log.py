@@ -1,8 +1,8 @@
 """The canonical JSON eval-log sink.
 
 Writes the immutable [`EvalLog`][inspect_robots.log.EvalLog] to ``log_dir`` once the run
-finishes. The write is atomic (synced temp file + exclusive hard link) so an interrupted
-overnight run never leaves a half-written log.
+finishes. A filename reservation protects atomic publication through a hard link or
+portable replacement, so an interrupted run never leaves a half-written final log.
 
 The file is strict RFC 8259 JSON: non-finite floats (``nan``, ``±inf``, e.g. a
 ``min_distance_to_goal`` score when no distance was ever recorded) are mapped
@@ -15,6 +15,7 @@ past the sanitizer, writing fails loudly instead of emitting ``Infinity``/
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
@@ -35,6 +36,13 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 # Leaves room for the filename's "_" + 32 hex chars + ".json.tmp" suffix inside a
 # 255-byte name, with headroom for filesystems that allow less.
 _SLUG_MAX = 200
+_UNSUPPORTED_LINK_ERRORS = {
+    errno.EOPNOTSUPP,
+    errno.ENOTSUP,
+    errno.ENOSYS,
+    errno.EPERM,
+    errno.EINVAL,
+}
 
 
 def _slug(name: str) -> str:
@@ -61,6 +69,27 @@ def _sanitize(obj: object) -> object:
     if isinstance(obj, (list, tuple)):
         return [_sanitize(value) for value in obj]
     return obj
+
+
+def _publish_log(tmp: Path, destination: Path) -> None:
+    """Exclude competing writers while publishing one complete immutable log."""
+    reservation = destination.with_name(f"{destination.name}.lock")
+    fd = os.open(reservation, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.close(fd)
+    try:
+        if os.path.lexists(destination):
+            raise FileExistsError(errno.EEXIST, "eval log already exists", str(destination))
+        try:
+            os.link(tmp, destination)
+        except OSError as exc:
+            if exc.errno not in _UNSUPPORTED_LINK_ERRORS:
+                raise
+            # All sink writers reserve the name before either publication path.
+            # On filesystems without hard links, replace stays atomic while the
+            # reservation prevents another writer from selecting this path.
+            os.replace(tmp, destination)
+    finally:
+        reservation.unlink()
 
 
 class JsonLogSink:
@@ -107,9 +136,7 @@ class JsonLogSink:
                 json.dump(_sanitize(log.to_dict()), fh, indent=2, sort_keys=True, allow_nan=False)
                 fh.flush()
                 os.fsync(fh.fileno())
-            # Linking a complete temp file publishes it atomically and refuses
-            # to replace an existing immutable log if names ever collide.
-            os.link(tmp, destination)
+            _publish_log(tmp, destination)
         finally:
             tmp.unlink(missing_ok=True)
         self.path = destination

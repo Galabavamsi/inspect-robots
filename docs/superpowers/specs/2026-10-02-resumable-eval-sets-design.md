@@ -25,6 +25,12 @@ A checkpoint uses one writer at a time. Creating it takes an exclusive sibling l
 
 ## Execution and logs:
 
+Final JSON publication exclusively reserves its chosen filename. It publishes
+a synced temporary file through a hard link, or an atomic replacement when hard
+links are unsupported. Competing sink writers and existing logs cannot claim the
+reserved name. Reservations and temporary files are cleaned after publication
+or failure.
+
 `eval_set` evaluates the unfinished scene subset of each task using the existing `eval()` pipeline and scorer contract. It keeps the original task order and returns one aggregate `EvalLog` per task. An attempt log is saved before the manifest references it, including the partial log written on Ctrl-C. Exceptions still yield an error log for the task and do not trigger automatic retries. When a checkpoint attempt exits without a saved log, scheduling stops immediately and returns only the task logs collected so far, preserving the unresolved in-flight marker. A secondary sink failure after log publication permits later tasks to run because that attempt can be reconciled from its saved log. Sinks observe each real attempt and do not receive a synthetic second lifecycle for the aggregate.
 
 Successful scene records are chosen from the earliest completed attempt and are never rerun. For an unfinished scene, the latest attempt's record is retained. The aggregate log lists retained scenes in original task order and recomputes finite metrics from the chosen `SceneResult.reduced` values with the existing per-scene mean rule. A metric with any non-finite or persisted `null` scene score is omitted, so the first and resumed aggregate agree. A new optional `EvalLog.source_logs` tuple records every attempt-log path for audit. Aggregate `EvalStats.duration_s` and `total_steps` cover every attempt, including discarded retries; `mean_inference_latency_s` is `None` because attempt logs do not store the inference count needed for an exact weighted mean. `total_trials` counts chosen scene records, and `errored_trials` sums a new `SceneResult.errored_trials` field from those records. That field is zero for a successful legacy scene and is set exactly by new attempts. The aggregate succeeds only when every planned scene is complete; otherwise it reports an error and lists only the scenes attempted so far in original task order.
