@@ -357,6 +357,51 @@ def test_checkpoint_rejects_changed_declared_callback_settings(
         )
 
 
+def test_checkpoint_uses_identity_attached_to_bound_callable(tmp_path: Path) -> None:
+    """A method's declared revision governs reuse when its owner has no hook."""
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.rollout import TrialRecord
+
+    class _Grade:
+        def grade(self, record: TrialRecord, scene: Scene) -> None:
+            del scene
+            record.operator_judgement = "yes"
+
+    revision = [1]
+    _Grade.grade.checkpoint_identity = lambda: {"revision": revision[0]}  # type: ignore[attr-defined]
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    callback = _Grade().grade
+    first_success, first_logs = eval_set(
+        _task(),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        before_scoring=callback,
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    same_success, same_logs = eval_set(
+        _task(),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        before_scoring=callback,
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    assert first_success and same_success
+    assert first_logs[0].source_logs == same_logs[0].source_logs
+    revision[0] = 2
+    with pytest.raises(ConfigError, match="checkpoint identity"):
+        eval_set(
+            _task(),
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            before_scoring=callback,
+            checkpoint_path=str(checkpoint),
+            log_dir=str(log_dir),
+        )
+
+
 def test_checkpoint_rejects_non_json_callback_identity(tmp_path: Path) -> None:
     """Invalid declared callback settings fail before a checkpoint is created."""
     from inspect_robots.errors import ConfigError

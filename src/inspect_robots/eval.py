@@ -1076,8 +1076,10 @@ def _callback_identity(value: object) -> dict[str, object] | None:
     """Require custom grading callbacks to declare hidden settings for reuse."""
     if value is None:
         return None
-    owner = getattr(value, "__self__", value)
-    hook = getattr(owner, "checkpoint_identity", None)
+    hook = getattr(value, "checkpoint_identity", None)
+    if not callable(hook):
+        owner = getattr(value, "__self__", None)
+        hook = getattr(owner, "checkpoint_identity", None)
     if not callable(hook):
         raise ConfigError(
             "before_scoring needs a JSON checkpoint_identity() hook in checkpoint mode"
