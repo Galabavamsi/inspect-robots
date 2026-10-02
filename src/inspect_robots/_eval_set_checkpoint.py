@@ -53,6 +53,68 @@ def _scorer_identity(scorer: Scorer) -> dict[str, str]:
     }
 
 
+def _component_identity(value: object, *, name: str) -> dict[str, str]:
+    """Capture effective action middleware settings and require opaque declarations."""
+    from inspect_robots.approver import (
+        AutoApprover,
+        ChainApprover,
+        ClampApprover,
+        DeltaLimitApprover,
+    )
+    from inspect_robots.controller import (
+        DefaultController,
+        EnsemblingController,
+        SmoothingController,
+    )
+
+    cls = type(value)
+    hook = getattr(value, "checkpoint_identity", None)
+    config: object
+    if callable(hook):
+        config = hook()
+    elif cls is DefaultController:
+        config = {"replan_interval": cast(DefaultController, value).replan_interval}
+    elif cls is SmoothingController:
+        smoothing = cast(SmoothingController, value)
+        config = {
+            "alpha": smoothing.alpha,
+            "inner": _component_identity(smoothing.inner, name=f"{name}.inner"),
+        }
+    elif cls is EnsemblingController:
+        ensembling = cast(EnsemblingController, value)
+        config = {"m": ensembling.m, "action_space": asdict(ensembling.action_space)}
+    elif cls is AutoApprover:
+        config = {}
+    elif cls is ClampApprover:
+        config = {"action_space": asdict(cast(ClampApprover, value)._space)}
+    elif cls is DeltaLimitApprover:
+        limiter = cast(DeltaLimitApprover, value)
+        config = (
+            {"absolute": True, "delta": limiter._delta}
+            if limiter._absolute
+            else {"absolute": False, "low": limiter._low, "high": limiter._high}
+        )
+    elif cls is ChainApprover:
+        config = {
+            "approvers": [
+                _component_identity(approver, name=f"{name}.approvers[{index}]")
+                for index, approver in enumerate(cast(ChainApprover, value)._approvers)
+            ]
+        }
+    else:
+        raise ConfigError(f"{name} needs a JSON checkpoint_identity() hook in checkpoint mode")
+    try:
+        encoded = json.dumps(
+            config, sort_keys=True, allow_nan=False, default=_identity_json_default
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ConfigError(f"{name} checkpoint identity must be JSON serializable: {exc}") from exc
+    return {
+        "type": f"{cls.__module__}.{cls.__qualname__}",
+        "config_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+    }
+
+
 def _identity(
     tasks: Sequence[Task],
     policy: Policy | str,

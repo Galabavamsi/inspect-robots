@@ -513,7 +513,8 @@ failures are not retried. Each retry starts that scene at epoch zero
 with the same seed. Ordinary policy errors, malformed actions, scorer errors,
 safety aborts, embodiment faults, and Ctrl-C do not trigger an automatic
 retry. A safety abort or embodiment fault also stops retries of earlier
-recoverable failures in that task. A later explicit call with the same
+recoverable failures in that task, including halts raised by policy lifecycle
+hooks. A later explicit call with the same
 checkpoint attempts any unfinished scene, including one that was not eligible
 for automatic retry.
 
@@ -528,7 +529,7 @@ saved aggregate log lists them in `source_logs` and selects one result per
 scene. Its `halted` flag records whether the latest attempt stopped for safety,
 a hardware fault, or cancellation. Metrics with non-finite or saved `null`
 scene scores are omitted from the aggregate. The checkpoint matches task
-declarations, scorer settings,
+declarations, scorer settings, effective controller and approver configuration,
 published policy and embodiment descriptions (including their spaces and
 capabilities), seed,
 `log_dir`, scoring and artifact options, and the CLI's resolved constructor
@@ -541,6 +542,13 @@ hardware state outside the recorded inputs cannot be detected automatically.
 Custom scorers that are not dataclasses must provide a JSON-serializable
 `checkpoint_identity()` method to identify stable settings. Dataclass scorers
 use their fields by default.
+
+Built-in controllers and approvers include their effective settings in the
+checkpoint identity, including nested controllers and ordered approver chains.
+Custom implementations and subclasses must provide a JSON-serializable
+`checkpoint_identity()` hook declaring their behavior revision and configuration.
+These settings are stored as digests. Calls without a checkpoint do not require
+this hook.
 
 In checkpointed API calls, custom `before_scoring` callbacks must provide a
 JSON-serializable `checkpoint_identity()` hook on the callable or its bound

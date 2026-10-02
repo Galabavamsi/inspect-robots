@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
@@ -15,6 +16,10 @@ from inspect_robots.scene import Scene
 from inspect_robots.scorer import success_at_end
 from inspect_robots.task import Epochs, Task
 from inspect_robots.types import ActionChunk, Observation
+
+if TYPE_CHECKING:
+    from inspect_robots.approver import Approver
+    from inspect_robots.controller import Controller
 
 
 class _OneTransientFailure(ScriptedPolicy):
@@ -218,6 +223,242 @@ def test_checkpoint_rejects_closure_held_scorer_settings(tmp_path: Path) -> None
             log_dir=str(tmp_path / "logs"),
         )
     assert not checkpoint.exists()
+
+
+def _execution_components(case: str, setting: int) -> tuple[Controller | None, Approver | None]:
+    """Vary effective built-in settings while retaining each component type."""
+    import numpy as np
+
+    from inspect_robots.approver import (
+        AutoApprover,
+        ChainApprover,
+        ClampApprover,
+        DeltaLimitApprover,
+    )
+    from inspect_robots.controller import (
+        DefaultController,
+        EnsemblingController,
+        SmoothingController,
+    )
+    from inspect_robots.spaces import ActionSemantics, Box
+
+    space_scale = (
+        setting if case in {"clamp", "delta-displacement", "chain-clamp", "ensembling-space"} else 1
+    )
+    space = Box(
+        shape=(2,),
+        low=np.full(2, -0.1 / space_scale),
+        high=np.full(2, 0.1 / space_scale),
+        semantics=ActionSemantics(control_mode="eef_delta_pos"),
+    )
+    absolute_space = Box(shape=(2,), semantics=ActionSemantics(control_mode="joint_pos"))
+    controllers: dict[str, Controller] = {
+        "default": DefaultController(replan_interval=setting),
+        "smoothing": SmoothingController(DefaultController(), alpha=0.5 / setting),
+        "smoothing-inner": SmoothingController(DefaultController(replan_interval=setting)),
+        "ensembling": EnsemblingController(space, m=0.1 * setting),
+        "ensembling-space": EnsemblingController(space),
+    }
+    clamp = ClampApprover(space)
+    delta = DeltaLimitApprover(space)
+    approvers: dict[str, Approver] = {
+        "clamp": clamp,
+        "delta-absolute": DeltaLimitApprover(absolute_space, max_delta=0.1 / setting),
+        "delta-displacement": delta,
+        "chain-clamp": ChainApprover(AutoApprover(), clamp),
+        "chain-order": (
+            ChainApprover(clamp, delta) if setting == 1 else ChainApprover(delta, clamp)
+        ),
+    }
+    return controllers.get(case), approvers.get(case)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "default",
+        "smoothing",
+        "smoothing-inner",
+        "ensembling",
+        "ensembling-space",
+        "clamp",
+        "delta-absolute",
+        "delta-displacement",
+        "chain-clamp",
+        "chain-order",
+    ],
+)
+def test_checkpoint_matches_effective_execution_component_settings(
+    tmp_path: Path, case: str
+) -> None:
+    """Equal settings reuse attempts, while changed action constraints reject reuse."""
+    from inspect_robots.errors import ConfigError
+
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    controller, approver = _execution_components(case, 1)
+    first_success, first_logs = eval_set(
+        _task(),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        controller=controller,
+        approver=approver,
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    controller, approver = _execution_components(case, 1)
+    same_success, same_logs = eval_set(
+        _task(),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        controller=controller,
+        approver=approver,
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    assert first_success and same_success
+    assert first_logs[0].source_logs == same_logs[0].source_logs
+    controller, approver = _execution_components(case, 2)
+    policy = ScriptedPolicy()
+    with pytest.raises(ConfigError, match="checkpoint identity"):
+        eval_set(
+            _task(),
+            policy,
+            CubePickEmbodiment(),
+            controller=controller,
+            approver=approver,
+            checkpoint_path=str(checkpoint),
+            log_dir=str(log_dir),
+        )
+    assert policy.num_inferences == 0
+
+
+def test_checkpoint_rejects_tightened_clamp_before_reusing_success(tmp_path: Path) -> None:
+    """A changed API action gate cannot reuse scores from unrestricted motion."""
+    import numpy as np
+
+    from inspect_robots.approver import ClampApprover
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.spaces import Box
+
+    checkpoint = tmp_path / "run.json"
+    log_dir = tmp_path / "logs"
+    success, first_logs = eval_set(
+        _task(),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        approver=ClampApprover(Box(shape=(2,))),
+        checkpoint_path=str(checkpoint),
+        log_dir=str(log_dir),
+    )
+    assert success and first_logs[0].results.metrics == {"success_at_end": 1.0}
+    tightened = ClampApprover(Box(shape=(2,), low=np.zeros(2), high=np.zeros(2)))
+    with pytest.raises(ConfigError, match="checkpoint identity"):
+        eval_set(
+            _task(),
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            approver=tightened,
+            checkpoint_path=str(checkpoint),
+            log_dir=str(log_dir),
+        )
+    _, fresh_logs = eval_set(
+        _task(),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        approver=tightened,
+        log_dir=str(log_dir),
+    )
+    assert fresh_logs[0].results.metrics == {"success_at_end": 0.0}
+
+
+@pytest.mark.parametrize("kind", ["controller", "approver"])
+def test_checkpoint_requires_identity_for_custom_execution_components(
+    tmp_path: Path, kind: str
+) -> None:
+    """Subclass settings stay opaque even when a built-in supplies their behavior."""
+    from inspect_robots.approver import AutoApprover
+    from inspect_robots.controller import DefaultController
+    from inspect_robots.errors import ConfigError
+
+    class _CustomController(DefaultController):
+        pass
+
+    class _CustomApprover(AutoApprover):
+        pass
+
+    controller = _CustomController() if kind == "controller" else None
+    approver = _CustomApprover() if kind == "approver" else None
+    checkpoint = tmp_path / "run.json"
+    with pytest.raises(ConfigError, match=f"{kind}.*checkpoint_identity"):
+        eval_set(
+            _task(),
+            ScriptedPolicy(),
+            CubePickEmbodiment(),
+            controller=controller,
+            approver=approver,
+            checkpoint_path=str(checkpoint),
+            log_dir=str(tmp_path / "logs"),
+        )
+    assert not checkpoint.exists()
+    assert not (tmp_path / "logs").exists()
+    success, _ = eval_set(
+        _task(),
+        ScriptedPolicy(),
+        CubePickEmbodiment(),
+        controller=controller,
+        approver=approver,
+        retry_attempts=1,
+        log_dir=str(tmp_path / "logs"),
+    )
+    assert success
+
+
+@pytest.mark.parametrize("kind", ["controller", "approver"])
+def test_checkpoint_compares_custom_execution_identity(tmp_path: Path, kind: str) -> None:
+    """Custom component declarations reject revisions and non-JSON settings."""
+    from inspect_robots.approver import AutoApprover
+    from inspect_robots.controller import DefaultController
+    from inspect_robots.errors import ConfigError
+
+    revision: list[object] = ["original"]
+
+    class _CustomController(DefaultController):
+        def checkpoint_identity(self) -> dict[str, object]:
+            return {"revision": revision[0]}
+
+    class _CustomApprover(AutoApprover):
+        def checkpoint_identity(self) -> dict[str, object]:
+            return {"revision": revision[0]}
+
+    controller = _CustomController() if kind == "controller" else None
+    approver = _CustomApprover() if kind == "approver" else None
+    checkpoint = tmp_path / "run.json"
+    for expected_error in [None, "checkpoint identity", "JSON"]:
+        if expected_error is None:
+            success, _ = eval_set(
+                _task(),
+                ScriptedPolicy(),
+                CubePickEmbodiment(),
+                controller=controller,
+                approver=approver,
+                checkpoint_path=str(checkpoint),
+                log_dir=str(tmp_path / "logs"),
+            )
+            assert success
+            revision[0] = "changed"
+        else:
+            with pytest.raises(ConfigError, match=expected_error):
+                eval_set(
+                    _task(),
+                    ScriptedPolicy(),
+                    CubePickEmbodiment(),
+                    controller=controller,
+                    approver=approver,
+                    checkpoint_path=str(checkpoint),
+                    log_dir=str(tmp_path / "logs"),
+                )
+            revision[0] = object()
 
 
 def test_checkpoint_rejects_grading_callback_without_declared_identity(tmp_path: Path) -> None:

@@ -972,6 +972,9 @@ def eval_set(
     to restart their scene during this invocation. Each retry begins at epoch zero.
     ``checkpoint_inputs`` adds caller-specific, JSON-serializable settings to the
     identity comparison. Its values are stored only as a SHA-256 digest.
+    Built-in controllers and approvers contribute their effective settings,
+    recursively for smoothing and approver chains. Custom implementations,
+    including subclasses, must declare a JSON ``checkpoint_identity()`` hook.
     A custom ``before_scoring`` callback in checkpoint mode must declare a JSON
     ``checkpoint_identity()`` hook on the callable or its bound-method owner.
     Include its behavior revision and hidden grading settings in that identity.
@@ -1124,7 +1127,12 @@ def _resumable_eval_set(
     checkpoint_inputs: Mapping[str, object] | None,
 ) -> tuple[bool, list[EvalLog]]:
     """Run unfinished scene subsets and publish aggregates from durable attempts."""
-    from inspect_robots._eval_set_checkpoint import _checkpoint_seed, _identity, _open_checkpoint
+    from inspect_robots._eval_set_checkpoint import (
+        _checkpoint_seed,
+        _component_identity,
+        _identity,
+        _open_checkpoint,
+    )
     from inspect_robots._eval_set_merge import _complete, _merge_task, _pending_scenes
     from inspect_robots.log import read_eval_log
     from inspect_robots.logging.json_log import JsonLogSink
@@ -1207,8 +1215,19 @@ def _resumable_eval_set(
         "store_frames": store_frames,
         "store_actions": store_actions,
         "grader": _grader_identity(grader),
-        "controller": _instance_identity(controller),
-        "approver": _instance_identity(approver),
+        "controller": (
+            _component_identity(
+                controller or DefaultController(cast(Policy, policy).config.replan_interval),
+                name="controller",
+            )
+            if checkpoint is not None
+            else None
+        ),
+        "approver": (
+            _component_identity(approver or AutoApprover(), name="approver")
+            if checkpoint is not None
+            else None
+        ),
         "operator_input": _instance_identity(operator_input),
         "before_scoring": (
             _callback_identity(before_scoring)
