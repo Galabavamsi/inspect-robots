@@ -512,8 +512,10 @@ timeout failures through the built-in controllers. Controller scheduling
 failures are not retried. Each retry starts that scene at epoch zero
 with the same seed. Ordinary policy errors, malformed actions, scorer errors,
 safety aborts, embodiment faults, and Ctrl-C do not trigger an automatic
-retry. A later explicit call with the same checkpoint attempts any unfinished
-scene, including one that was not eligible for automatic retry.
+retry. A safety abort or embodiment fault also stops retries of earlier
+recoverable failures in that task. A later explicit call with the same
+checkpoint attempts any unfinished scene, including one that was not eligible
+for automatic retry.
 
 The checkpoint marks an attempt in flight before it starts and clears the mark
 when its log is saved. If a crash or grading-hook error leaves the mark set,
@@ -522,8 +524,10 @@ attempt files, then start a new checkpoint after reconciling that run.
 
 The checkpoint contains paths to immutable attempt logs. The returned and
 saved aggregate log lists them in `source_logs` and selects one result per
-scene. Metrics with non-finite or saved `null` scene scores are omitted from
-the aggregate. The checkpoint matches task declarations, scorer settings,
+scene. Its `halted` flag records whether the latest attempt stopped for safety,
+a hardware fault, or cancellation. Metrics with non-finite or saved `null`
+scene scores are omitted from the aggregate. The checkpoint matches task
+declarations, scorer settings,
 published policy and embodiment descriptions (including their spaces and
 capabilities), seed,
 `log_dir`, scoring and artifact options, and the CLI's resolved constructor

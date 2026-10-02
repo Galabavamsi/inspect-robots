@@ -90,4 +90,5 @@ def _merge_task(task: Task, attempts: Sequence[tuple[EvalLog, str]]) -> EvalLog:
         samples=samples,
         error=error,
         source_logs=tuple(path for _, path in attempts),
+        halted=last.halted,
     )

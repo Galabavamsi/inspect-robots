@@ -1200,6 +1200,50 @@ def test_eval_set_never_retries_halt_class_failure(halt: str, tmp_path: Path) ->
     assert len(logs[0].source_logs) == 1
 
 
+@pytest.mark.parametrize("error_type", [SafetyAbort, EmbodimentFault])
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_eval_set_halt_suppresses_retries_of_earlier_scenes(
+    tmp_path: Path,
+    error_type: type[SafetyAbort] | type[EmbodimentFault],
+    checkpointed: bool,
+) -> None:
+    """A later halt blocks robot resets for earlier recoverable scene errors."""
+    from inspect_robots.log import read_eval_log
+
+    class _MixedHaltPolicy(_RecordingTransientPolicy):
+        def reset(self, scene: Scene) -> None:
+            self.scene_id = scene.id
+            super().reset(scene)
+
+        def act(self, observation: Observation) -> ActionChunk:
+            if self.scene_id == "halt":
+                raise error_type("stop")
+            return super().act(observation)
+
+    task = Task(
+        name="mixed-halt",
+        scenes=[Scene(id="early", instruction="reach"), Scene(id="halt", instruction="reach")],
+        scorer=success_at_end(),
+        max_steps=30,
+    )
+    policy = _MixedHaltPolicy()
+    success, logs = eval_set(
+        task,
+        policy,
+        CubePickEmbodiment(),
+        retry_attempts=1,
+        checkpoint_path=str(tmp_path / "run.json") if checkpointed else None,
+        log_dir=str(tmp_path / "logs"),
+    )
+
+    assert success is False
+    assert policy.resets == ["early", "halt"]
+    assert len(logs[0].source_logs) == 1
+    assert logs[0].halted is True
+    assert read_eval_log(logs[0].source_logs[0]).halted is True
+    assert logs[0].samples[0].retryable_error is True
+
+
 def test_eval_set_interrupt_records_partial_attempt_for_manual_resume(tmp_path: Path) -> None:
     """Ctrl-C publishes the cancelled attempt, then propagates immediately."""
     from inspect_robots.errors import _CancelledTrial

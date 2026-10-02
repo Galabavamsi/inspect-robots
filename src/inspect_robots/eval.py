@@ -842,6 +842,7 @@ def _run_eval(
         stats=stats,
         samples=tuple(scene_results),
         error=error,
+        halted=halted,
     )
     bus.on_eval_end(log)
     if cancelled_exc is not None:
@@ -1279,14 +1280,17 @@ def _resumable_eval_set(
                 attempts.append((attempt_log, str(path)))
                 merged = _merge_task(resolved_task, attempts)
                 recorded = {sample.scene_id: sample for sample in attempt_log.samples}
-                to_run = [
-                    scene
-                    for scene in to_run
-                    if scene.id in recorded
-                    and recorded[scene.id].retryable_error
-                    and not _complete(recorded[scene.id], resolved_task.epoch_spec.count)
-                    and attempt_counts[scene.id] <= retry_attempts
-                ]
+                if attempt_log.halted:
+                    to_run = []
+                else:
+                    to_run = [
+                        scene
+                        for scene in to_run
+                        if scene.id in recorded
+                        and recorded[scene.id].retryable_error
+                        and not _complete(recorded[scene.id], resolved_task.epoch_spec.count)
+                        and attempt_counts[scene.id] <= retry_attempts
+                    ]
             else:
                 aggregate = cast(EvalLog, merged)
                 aggregate_sink = JsonLogSink(log_dir)
