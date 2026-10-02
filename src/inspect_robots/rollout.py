@@ -251,13 +251,16 @@ def _store_frames(
     return replace(obs, images={}), refs
 
 
-def _end_operator_trial(operator_input: OperatorInput | None) -> None:
-    """Best-effort call the optional operator-input trial teardown hook."""
+def _end_operator_trial(operator_input: OperatorInput | None, record: TrialRecord, t: int) -> None:
+    """Contain ordinary input teardown errors while preserving explicit halts."""
     if operator_input is not None:
         try:
             end_trial = getattr(operator_input, "end_trial", None)
             if callable(end_trial):
                 end_trial()
+        except (SafetyAbort, EmbodimentFault) as exc:
+            _record_failure(record, exc, t)
+            raise
         except Exception as exc:
             # stacklevel=3 skips this helper so the warning points at rollout's
             # caller, like the disable-site warnings issued from rollout() itself.
@@ -295,6 +298,10 @@ def rollout(
     eval orchestrator can apply the correct continue-vs-halt policy. Every error
     raised from inside the trial carries the partial ``TrialRecord`` on
     ``exc.record`` for the orchestrator to preserve.
+
+    Ordinary operator-input errors disable that channel for the trial. Explicit
+    safety and hardware halts from its begin, poll, or optional end hook propagate
+    with the partial record, including measured latencies and policy audit data.
 
     The loop applies no wall-clock pacing of its own: ``embodiment.step()`` is
     called as fast as the policy/controller/approver can produce actions. An
@@ -336,9 +343,12 @@ def rollout(
         if operator_input is not None:
             try:
                 operator_input.begin_trial()
+            except (SafetyAbort, EmbodimentFault) as exc:
+                _record_failure(record, exc, t)
+                raise
             except Exception as exc:
                 console_ok = False
-                _end_operator_trial(operator_input)
+                _end_operator_trial(operator_input, record, t)
                 warnings.warn(
                     f"Operator console disabled for this trial after {type(exc).__name__}: {exc}",
                     RuntimeWarning,
@@ -352,9 +362,12 @@ def rollout(
             if operator_input is not None and console_ok:
                 try:
                     poll = operator_input.poll()
+                except (SafetyAbort, EmbodimentFault) as exc:
+                    _record_failure(record, exc, t)
+                    raise
                 except Exception as exc:
                     console_ok = False
-                    _end_operator_trial(operator_input)
+                    _end_operator_trial(operator_input, record, t)
                     warnings.warn(
                         "Operator console disabled for this trial after "
                         f"{type(exc).__name__}: {exc}",
@@ -548,11 +561,13 @@ def rollout(
         record.events.append(error_event(t, "KeyboardInterrupt", "cancelled by user"))
         raise _CancelledTrial(record.error, record) from exc
     finally:
-        _end_operator_trial(operator_input)
-        # Preserve measured latencies even when the trial ends in an error.
-        record.inference_latencies = [
-            lat for lat, _ in store.get(_INFER_KEY, []) if lat is not None
-        ]
-        if policy_reset_ok:  # pragma: no branch - false only while an exception unwinds
-            record.policy_transcript = _collect_transcript(policy)
+        try:
+            _end_operator_trial(operator_input, record, t)
+        finally:
+            # Preserve measured latencies and audit data even if teardown halts.
+            record.inference_latencies = [
+                lat for lat, _ in store.get(_INFER_KEY, []) if lat is not None
+            ]
+            if policy_reset_ok:  # pragma: no branch - false only while an exception unwinds
+                record.policy_transcript = _collect_transcript(policy)
     return record

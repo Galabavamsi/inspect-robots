@@ -514,7 +514,7 @@ with the same seed. Ordinary policy errors, malformed actions, scorer errors,
 safety aborts, embodiment faults, and Ctrl-C do not trigger an automatic
 retry. A safety abort or embodiment fault also stops retries of earlier
 recoverable failures in that task, including halts raised by policy lifecycle
-hooks. A later explicit call with the same
+or operator-input hooks. A later explicit call with the same
 checkpoint attempts any unfinished scene, including one that was not eligible
 for automatic retry.
 

@@ -1804,6 +1804,88 @@ def test_eval_set_lifecycle_halt_stops_epochs_scenes_and_retries(
     assert attempt.error is not None and "stop in lifecycle" in attempt.error
 
 
+@pytest.mark.parametrize("error_type", [SafetyAbort, EmbodimentFault])
+@pytest.mark.parametrize("checkpointed", [False, True])
+@pytest.mark.parametrize("phase", ["begin", "poll", "end"])
+def test_eval_set_operator_input_halt_stops_scenes_and_retries(
+    tmp_path: Path,
+    error_type: type[SafetyAbort] | type[EmbodimentFault],
+    checkpointed: bool,
+    phase: str,
+) -> None:
+    """An input e-stop must preserve its partial trial and suppress all replay."""
+    from dataclasses import replace
+
+    from inspect_robots.console import ConsolePoll
+    from inspect_robots.log import read_eval_log
+
+    class _Policy(_RecordingTransientPolicy):
+        def reset(self, scene: Scene) -> None:
+            self.scene_id = scene.id
+            super().reset(scene)
+
+        def act(self, observation: Observation) -> ActionChunk:
+            return replace(super().act(observation), inference_latency_s=0.1)
+
+        def transcript(self) -> dict[str, str]:
+            return {"scene": self.scene_id}
+
+    policy = _Policy()
+
+    class _Input:
+        def begin_trial(self) -> None:
+            self.poll_count = 0
+            if policy.scene_id == "halt" and phase == "begin":
+                raise error_type("input e-stop")
+
+        def poll(self) -> ConsolePoll:
+            self.poll_count += 1
+            if policy.scene_id == "halt" and phase == "poll" and self.poll_count == 2:
+                raise error_type("input e-stop")
+            return ConsolePoll()
+
+        def end_trial(self) -> None:
+            if policy.scene_id == "halt" and phase == "end":
+                raise error_type("input e-stop")
+
+    task = Task(
+        name="operator-halt",
+        scenes=[Scene(id=name, instruction="reach") for name in ["early", "halt", "after"]],
+        scorer=success_at_end(),
+        max_steps=30,
+    )
+    success, logs = eval_set(
+        task,
+        policy,
+        CubePickEmbodiment(),
+        operator_input=_Input(),
+        retry_attempts=1,
+        checkpoint_path=str(tmp_path / "run.json") if checkpointed else None,
+        log_dir=str(tmp_path / "logs"),
+    )
+
+    assert success is False
+    assert policy.resets == ["early", "halt"]
+    assert len(logs[0].source_logs) == 1
+    assert logs[0].halted is True
+    attempt = read_eval_log(logs[0].source_logs[0])
+    assert attempt.halted is True
+    assert [sample.scene_id for sample in attempt.samples] == ["early", "halt"]
+    assert attempt.samples[1].status == "error"
+    assert len(attempt.samples[1].epochs) == 1
+    assert attempt.samples[1].policy_transcripts == ({"scene": "halt"},)
+    assert attempt.error is not None and "input e-stop" in attempt.error
+    if phase == "begin":
+        assert attempt.stats.total_steps == 0
+        assert attempt.stats.mean_inference_latency_s is None
+    elif phase == "poll":
+        assert attempt.stats.total_steps == 1
+        assert attempt.stats.mean_inference_latency_s == pytest.approx(0.1)
+    else:
+        assert attempt.stats.total_steps > 1
+        assert attempt.stats.mean_inference_latency_s == pytest.approx(0.1)
+
+
 def test_eval_set_interrupt_records_partial_attempt_for_manual_resume(tmp_path: Path) -> None:
     """Ctrl-C publishes the cancelled attempt, then propagates immediately."""
     from inspect_robots.errors import _CancelledTrial

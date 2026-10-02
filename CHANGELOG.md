@@ -18,7 +18,7 @@ All notable changes to this project are documented here. The format is based on
   ([#136](https://github.com/robocurve/inspect-robots/issues/136)).
   Controller and approver settings participate in checkpoint matching; custom
   middleware and grading callbacks declare their checkpoint identity. Policy
-  lifecycle safety and hardware halts suppress retries. Final JSON
+  lifecycle and operator-input safety and hardware halts suppress retries. Final JSON
   publication protects collisions on filesystems with or without hard links.
 
 - **Agent plugin (0.28.0):** Accept `-P service_tier=ultrafast` on the Responses wire
