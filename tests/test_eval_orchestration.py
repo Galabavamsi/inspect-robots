@@ -1466,6 +1466,42 @@ def test_abort_cleanup_survives_warnings_as_errors_and_runs_once() -> None:
     assert _FailingCleanupSink.calls == 1
 
 
+def test_raising_hook_lookup_keeps_the_original_error_and_later_sinks() -> None:
+    class _RaisingLookupSink(NullSink):
+        @property
+        def on_eval_error(self) -> object:
+            raise RuntimeError("lookup exploded")
+
+    later = _AbortSink()
+    bus = _Broadcast([_RaisingLookupSink(), later])
+    bus.on_eval_start(
+        EvalSpec(task="t", policy="p", embodiment="e", created="now", inspect_robots_version="0")
+    )
+    interrupt = KeyboardInterrupt("ctrl-c")
+    with pytest.warns(RuntimeWarning, match="lookup exploded"):
+        bus.on_eval_error(interrupt)
+
+    assert later.events == ["error:KeyboardInterrupt: ctrl-c"]
+
+
+def test_failing_sink_setup_still_closes_owned_embodiment(tmp_path: Path) -> None:
+    class _RaisingSetupSink(NullSink):
+        @property
+        def log_policy_messages(self) -> object:
+            raise RuntimeError("setup exploded")
+
+    _CLOSED.clear()
+    with pytest.raises(RuntimeError, match="setup exploded"):
+        eval(
+            _task(),
+            ScriptedPolicy(),
+            "closable-cubepick",
+            log_dir=str(tmp_path),
+            sinks=[_RaisingSetupSink()],
+        )
+    assert _CLOSED == ["closed"]
+
+
 def test_before_scoring_default_none_records_no_judgements(tmp_path: Path) -> None:
     (log,) = eval(_task(epochs=2), ScriptedPolicy(), CubePickEmbodiment(), log_dir=str(tmp_path))
     assert log.samples[0].operator_judgements == (None, None)

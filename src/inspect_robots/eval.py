@@ -384,11 +384,12 @@ class _Broadcast:
         """
         open_sinks, self._open_sinks = self._open_sinks, []
         for s in open_sinks:
-            hook: Any = getattr(s, "on_eval_error", None)
-            if not callable(hook):
-                continue
             try:
-                hook(error)
+                # Lookup is guarded too: a raising property must not replace
+                # the propagating error or starve the remaining sinks.
+                hook: Any = getattr(s, "on_eval_error", None)
+                if callable(hook):
+                    hook(error)
             except BaseException as exc:
                 with suppress(BaseException):
                     warnings.warn(
@@ -541,10 +542,12 @@ def eval(
         if isinstance(embodiment, str)
         else embodiment
     )
-    # Built here rather than in _run_eval so an escaping error can still reach
-    # the sinks' optional on_eval_error cleanup hook.
-    bus = _Broadcast(sinks if sinks is not None else [JsonLogSink(log_dir)])
+    bus: _Broadcast | None = None
     try:
+        # Built here rather than in _run_eval so an escaping error can still
+        # reach the sinks' optional on_eval_error cleanup hook, and inside the
+        # try so a failing sink setup still closes an owned embodiment.
+        bus = _Broadcast(sinks if sinks is not None else [JsonLogSink(log_dir)])
         return _run_eval(
             task,
             policy,
@@ -566,7 +569,8 @@ def eval(
             policy_checkpoint=policy_checkpoint,
         )
     except BaseException as exc:
-        bus.on_eval_error(exc)
+        if bus is not None:
+            bus.on_eval_error(exc)
         raise
     finally:
         # Close what we opened: a registry-resolved embodiment is released even
